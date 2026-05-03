@@ -190,16 +190,6 @@ pip install pyrealsense2 numpy opencv-python Pillow open3d ultralytics scipy sci
 
 ---
 
-## Results
-
-| Method | Avg. Processing Time | Avg. Position Error |
-|---|---|---|
-| 2D only | ~35 ms | ~8.5 mm |
-| 3D only | ~120 ms | ~5.2 mm |
-| **2D–3D (ours)** | **~85 ms** | **~2.8 mm** |
-
----
-
 ## CAD Models
 
 All mechanical parts are designed in **SolidWorks**. A STEP export (`ROBOT_6DOF_ASSEM.STEP`) is included for compatibility with other CAD tools (Fusion 360, FreeCAD, etc.).
