@@ -126,14 +126,11 @@ Results correspond to 520 RGB-D samples from 250 specimens.
 │
 └── Vision2D-3D/
     ├── realsense_gui_advanced.py # Main vision GUI application
-    ├── test_segment.py           # Standalone YOLO segmentation test
     ├── view_pointcloud.py        # Point cloud viewer utility
-    ├── ply_editor.py             # PLY file editor
-    ├── draw.py                   # Evaluation plots (speed vs. accuracy)
     ├── v8_seg_1024.pt            # Segmentation model used by the application
     ├── roi_config.txt            # Saved ROI configuration
     ├── Output_image/             # Exported result images
-    └── Output_pointcloud/        # Exported .pcd/.ply + JSON tip data
+    └── Output_pointcloud/        # Generated automatically at runtime
 ```
 
 ---
@@ -143,7 +140,7 @@ Results correspond to 520 RGB-D samples from 250 specimens.
 | Component | Specification |
 |---|---|
 | Robot controller | Arduino Mega 2560 |
-| Joints | 6× Stepper motors (TB6600 drivers) |
+| Joints | 6× stepper motors (5× TB6600 and 1× TMC2208 drivers) |
 | Depth camera | Intel RealSense D435i |
 | End-effector | Pneumatic gripper (SMC MHZ2-16D) |
 | Gripper control | Digital pin D3 (HIGH = close) |
@@ -216,7 +213,7 @@ python realsense_gui_advanced.py
 #### Features
 
 - **Real-time RGB + Depth preview** at 1280×720 @ 30 FPS (cropped to 720×720)
-- **YOLOv8m Instance Segmentation** — runs every 5 frames for stability
+- **YOLOv8s Instance Segmentation** — runs every 5 frames for stability
 - **Skeleton analysis** of each segmented shoot:
   - Tip detection (endpoints of skeleton branches)
   - Cutting point & cutting angle calculation

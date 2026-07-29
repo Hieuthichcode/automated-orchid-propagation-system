@@ -20,5 +20,6 @@ datasets/
 outputs/
 results/
 *.log
+~$*
 .DS_Store
 Thumbs.db
