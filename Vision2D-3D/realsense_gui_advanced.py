@@ -138,13 +138,6 @@ class RealSenseGUI:
                 'ransac_threshold_mm': 3.0,
                 'ransac_iterations': 500,
                 'ransac_seed': 0,
-                # ⚠️ 2 ngưỡng CHẤT LƯỢNG dưới đây là GIÁ TRỌ MẶC ĐỬNH,
-                # CHƯA được xác nhận bằng dữ liệu ROI nền thực tế của hệ thống.
-                # KHÔNG tuyên bố đây là ngưỡng đã thực nghiệm xác nhận - cần
-                # người dùng hiệu chỉnh lại cho đúng điều kiện lắp đặt camera/bàn
-                # trước khi dùng thực tế. Khác với min_inliers=3 (ràng buộc HìNH
-                # HỌC tối thiểu để xác định 1 mặt phẳng) - đây là ngưỡng CHẤT
-                # LƯỢNG (mức hỗ trợ của plane trong ROI).
                 'ransac_min_inliers': 30,
                 'ransac_min_inlier_ratio': 0.5,
                 'normalization_rotation_only': True,
@@ -165,16 +158,7 @@ class RealSenseGUI:
                 'basal_radius_mm': 8.0,
                 'growth_axis_is_local_z': True,
                 'camera_reference_axis': (0.0, 0.0, 1.0),
-                # � Chỉ xử lý instance thuộc target_class_id (0 = "thân/nhánh" -
-                # đối tượng cần kẹp, theo đúng quy ước dữ liệu YOLO hiện có;
-                # 1 = "gốc" chỉ dùng làm mốc tham chiếu, KHÔNG kẹp).
                 'target_class_id': 0,
-                # 🔄 KHÔNG tự chọn instance theo mask_area (không thuộc phương
-                # pháp trong bản thảo). explicit_only = chỉ dùng 1 instance duy
-                # nhất khi được chỉ định rõ qua target_instance_index (ROI/người
-                # dùng/lệnh ngoài), hoặc khi chỉ có đúng 1 instance thành công.
-                # Nếu có nhiều instance hợp lệ mà target_instance_index=None,
-                # hệ thống KHÔNG tự chọn và KHÔNG gán last_grasp_result.
                 'target_selection_rule': 'explicit_only',
                 'target_instance_index': None,
             },
@@ -201,7 +185,7 @@ class RealSenseGUI:
     def load_yolo_model(self):
         """Load YOLOv8 segmentation model"""
         try:
-            model_path = os.path.join(os.path.dirname(__file__), 'best.pt')
+            model_path = os.path.join(os.path.dirname(__file__), 'v8_seg_1024.pt')
             if os.path.exists(model_path):
                 print(f"Loading YOLO model: {model_path}")
                 self.yolo_model = YOLO(model_path)
