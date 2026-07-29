@@ -1,6 +1,8 @@
 # Automated Orchid Propagation System
 
-> **Graduation Thesis (DATN)** — An integrated robotic system for automated orchid shoot cutting, gripping, and branching using a custom 6-DOF robot arm and 2D/3D vision.
+> **Graduation Thesis (DATN)** — A hybrid 2D–3D RGB-D method for estimating the
+> growth axis of Phalaenopsis orchid buds and converting the estimated axis into
+> a robot-referenced 6-DOF grasp pose, integrated with a custom 6-DOF robot arm.
 
 ---
 
@@ -20,28 +22,90 @@
 
 ## Overview
 
-This project combines a custom-built **6-DOF serial robot arm** with an **Intel RealSense D435i depth camera** and a **YOLOv8 instance segmentation model** to autonomously detect, locate, and cut orchid shoots (*mầm lan*) — replacing manual labor in orchid propagation.
+This repository implements a hybrid 2D–3D RGB-D method for estimating the
+growth axis of Phalaenopsis orchid buds and converting the estimated axis into
+a robot-referenced 6-DOF grasp pose. The pipeline combines instance
+segmentation, 2D skeleton guidance, depth-based point-cloud processing, and PCA
+axis estimation.
+
+This project combines a custom-built **6-DOF serial robot arm** with an **Intel RealSense D435i depth camera** and a **YOLOv8 instance segmentation model** to autonomously detect, locate, and manipulate orchid shoots (*mầm lan*) — replacing manual labor in orchid propagation.
 
 ### System Pipeline
 
 ```
-RealSense D435i Camera
+RGB-D acquisition (RealSense D435i)
         │
         ▼
-YOLOv8m Instance Segmentation (v8m-seg-832.pt)
-        │  detect & segment each orchid shoot
+Instance segmentation (YOLOv8, best.pt)
+        │  detect & segment each orchid bud
         ▼
-Skeleton Analysis → Tip Detection → Cutting Point & Angle
-        │  3D coordinate extraction from depth map
+2D skeleton extraction
+        │  tip detection, cutting point & angle
         ▼
-JSON Export (cutting coordinates + orientation)
+Point-cloud reconstruction and filtering
+        │  depth-based 3D extraction, outlier removal
+        ▼
+Skeleton-guided branch selection
         │
         ▼
-Arduino Mega 2560 — Inverse Kinematics (on-board)
+PCA growth-axis estimation
+        │
+        ▼
+Camera-to-robot transformation
+        │
+        ▼
+6-DOF grasp pose → Arduino Mega 2560 (IK on-board)
         │  quintic trajectory interpolation
         ▼
 6-DOF Stepper Robot → Cut / Grip / Branch
 ```
+
+---
+
+## Data and pretrained models
+
+Representative image samples, trained model weights, and the raw numerical
+evaluation data are available in the
+[Google Drive folder](https://drive.google.com/drive/folders/1FqTuIMWtxHYL037exPB-O3m-0CBoGs5N?usp=drive_link).
+
+The shared folder contains:
+
+- `Images/`: representative JPEG images;
+- `Model_train/weights/best.pt`: recommended segmentation weight for inference;
+- `Model_train/weights/epoch360.pt` and `last.pt`: additional checkpoints;
+- `Data_test/angularError_data.xlsx`: angular-error evaluation data;
+- `Data_test/Time_data.xlsx`: processing-time evaluation data.
+
+The segmentation dataset contained 3,104 original RGB images. The
+train/validation/test split (75%/15%/10%) was applied before augmentation, and
+only the training subset was augmented, resulting in 11,876 images across the
+three subsets.
+
+---
+
+## Segmentation model
+
+The instance-segmentation model was trained for 380 epochs using AdamW with a
+learning rate of 0.001 and an input size of 1024 × 1024 pixels. The selected
+model achieved a mask mAP@0.5 of 0.970 on the validation set. The recommended
+inference weight is `best.pt` in the shared Google Drive folder.
+
+---
+
+## Performance overview
+
+The proposed hybrid method achieved the lowest mean angular error while
+remaining substantially faster than the Global 3D PCA baseline.
+
+| Method | Angular error (mean ± SD) | Processing time |
+|---|---:|---:|
+| 2D Skeleton | 14.2° ± 6.1° | 32 ms |
+| Global 3D PCA | 9.3° ± 4.2° | 120 ms |
+| Hybrid 2D–3D | 5.1° ± 3.3° | 65 ms |
+
+Results correspond to 520 RGB-D samples from 250 specimens.
+
+![Processing-time and angular-error trade-off](docs/images/processing_time_angular_error_tradeoff.png)
 
 ---
 
@@ -135,7 +199,9 @@ STATUS                                    # Print current joint angles
 
 ### 2. Vision Application — `realsense_gui_advanced.py`
 
-**Requirements:** Python 3.8+, see [Dependencies](#dependencies)
+**Requirements:** Python 3.11, see [Dependencies](#dependencies)
+
+1. Download `best.pt` from the [Google Drive folder](https://drive.google.com/drive/folders/1FqTuIMWtxHYL037exPB-O3m-0CBoGs5N?usp=drive_link) (`Model_train/weights/best.pt`) and place it in the `Vision2D-3D/` directory.
 
 ```bash
 cd Vision2D-3D
@@ -171,22 +237,53 @@ python realsense_gui_advanced.py
 
 ### Python (Vision)
 
+> **Note:** For CUDA-enabled PyTorch, install it separately using the
+> [official PyTorch installation selector](https://pytorch.org/get-started/locally/)
+> before running `pip install -r requirements.txt`.
+
 ```bash
-pip install pyrealsense2 numpy opencv-python Pillow open3d ultralytics scipy scikit-image
+pip install -r requirements.txt
 ```
 
-| Package | Version (tested) |
+| Package | Verified version |
 |---|---|
-| pyrealsense2 | ≥ 2.54 |
-| ultralytics (YOLOv8) | ≥ 8.0 |
-| open3d | ≥ 0.17 |
-| opencv-python | ≥ 4.8 |
-| scipy | ≥ 1.11 |
-| scikit-image | ≥ 0.21 |
+| pyrealsense2 | 2.55.1.6486 |
+| ultralytics (YOLOv8) | 8.3.59 |
+| torch | 2.1.2+cu121 |
+| torchvision | 0.16.2+cu121 |
+| open3d | 0.19.0 |
+| opencv-python | 4.10.0.84 |
+| numpy | 1.26.4 |
+| scipy | 1.13.1 |
+| scikit-image | 0.24.0 |
 
 ### Arduino
 
 - [AccelStepper](https://www.airspayce.com/mikem/arduino/AccelStepper/) library
+
+---
+
+## Reproducibility
+
+Verified environment for reported results:
+
+```
+Python            3.11.9
+ultralytics       8.3.59
+torch             2.1.2+cu121
+torchvision       0.16.2+cu121
+opencv-python     4.10.0.84
+open3d            0.19.0
+numpy             1.26.4
+scikit-image      0.24.0
+pyrealsense2      2.55.1.6486
+scipy             1.13.1
+CUDA runtime      12.1
+cuDNN             8801
+GPU               NVIDIA GeForce RTX 3060
+Training seed     0
+PyTorch deterministic algorithms: False
+```
 
 ---
 

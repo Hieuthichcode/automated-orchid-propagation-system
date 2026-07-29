@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Model weights and training outputs
+*.pt
+runs/
+weights/
+
+# External datasets and raw evaluation data
+data/
+dataset/
+datasets/
+*.xlsx
+
+# Generated results and local files
+outputs/
+results/
+*.log
+.DS_Store
+Thumbs.db

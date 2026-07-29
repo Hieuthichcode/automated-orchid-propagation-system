@@ -11,6 +11,7 @@ from ultralytics import YOLO
 import os
 from datetime import datetime
 from scipy.ndimage import binary_erosion
+from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize
 from collections import deque
 import json
@@ -28,6 +29,15 @@ class RealSenseGUI:
         self.is_running = False
         self.is_preview = True
         self.frame_queue = Queue(maxsize=2)
+        
+        # 🔒 Đồng bộ truy cập camera: mọi thao tác wait_for_frames()+align.process()
+        # (dù từ thread preview hay từ main thread - Hybrid pipeline, Pass1/2,
+        # hand-eye calib...) ĐỀU phải giữ chung camera_lock này để tránh 2 luồng
+        # gọi RealSense API đồng thời. preview_event dùng để thread preview NGỦ
+        # (không busy-loop) khi preview bị tắt.
+        self.camera_lock = threading.Lock()
+        self.preview_event = threading.Event()
+        self.preview_event.set()  # preview mặc định đang BẬT (is_preview=True)
         
         # Lưu point cloud để có thể save sau
         self.last_pcd = None
@@ -108,6 +118,80 @@ class RealSenseGUI:
         # Load ROI từ file nếu có
         self.load_roi()
         
+        # ============================================================
+        # 🆕 HYBRID 2D-3D GRASP PIPELINE - Config & state
+        # (theo NOTE_Codex_Phuong_phap_MethodsX)
+        # ============================================================
+        self.pipeline_config = {
+            'morphology': {
+                'kernel_size': (3, 3),
+                'erosion_iterations': 2,
+                'dilation_iterations': 2,
+            },
+            'skeleton': {
+                'connectivity': 8,
+            },
+            'pointcloud': {
+                'sor_neighbors': 10,
+                'sor_std_ratio': 2.0,
+                'voxel_size_mm': 0.5,
+                'ransac_threshold_mm': 3.0,
+                'ransac_iterations': 500,
+                'ransac_seed': 0,
+                # ⚠️ 2 ngưỡng CHẤT LƯỢNG dưới đây là GIÁ TRỌ MẶC ĐỬNH,
+                # CHƯA được xác nhận bằng dữ liệu ROI nền thực tế của hệ thống.
+                # KHÔNG tuyên bố đây là ngưỡng đã thực nghiệm xác nhận - cần
+                # người dùng hiệu chỉnh lại cho đúng điều kiện lắp đặt camera/bàn
+                # trước khi dùng thực tế. Khác với min_inliers=3 (ràng buộc HìNH
+                # HỌC tối thiểu để xác định 1 mặt phẳng) - đây là ngưỡng CHẤT
+                # LƯỢNG (mức hỗ trợ của plane trong ROI).
+                'ransac_min_inliers': 30,
+                'ransac_min_inlier_ratio': 0.5,
+                'normalization_rotation_only': True,
+            },
+            'branch': {
+                'support_radius_px': 5,
+                'assignment_domain': 'image_pixels',
+                'assign_before_voxel_downsampling': True,
+                'overlap_policy': 'nearest_path',
+                'min_branch_points': 10,
+            },
+            'fusion': {
+                'alpha': 0.6,\
+                'theta_max_deg': 85.0,
+                'fallback': 'longest_valid_basal_to_endpoint_path',
+            },
+            'grasp': {
+                'basal_radius_mm': 8.0,
+                'growth_axis_is_local_z': True,
+                'camera_reference_axis': (0.0, 0.0, 1.0),
+                # � Chỉ xử lý instance thuộc target_class_id (0 = "thân/nhánh" -
+                # đối tượng cần kẹp, theo đúng quy ước dữ liệu YOLO hiện có;
+                # 1 = "gốc" chỉ dùng làm mốc tham chiếu, KHÔNG kẹp).
+                'target_class_id': 0,
+                # 🔄 KHÔNG tự chọn instance theo mask_area (không thuộc phương
+                # pháp trong bản thảo). explicit_only = chỉ dùng 1 instance duy
+                # nhất khi được chỉ định rõ qua target_instance_index (ROI/người
+                # dùng/lệnh ngoài), hoặc khi chỉ có đúng 1 instance thành công.
+                # Nếu có nhiều instance hợp lệ mà target_instance_index=None,
+                # hệ thống KHÔNG tự chọn và KHÔNG gán last_grasp_result.
+                'target_selection_rule': 'explicit_only',
+                'target_instance_index': None,
+            },
+        }
+        self._intrinsics_cache = None   # cache (fx,fy,cx,cy,depth_scale,start_x)
+        self.T_B_C = None                # 4x4 camera->robot-base (hand-eye calibration)
+        self.handeye_note = ''
+        self.load_handeye_calibration()
+        
+        # Cửa sổ & state cho Grasp Pose / Hand-eye Calibration
+        self.grasp_result_window = None
+        self.grasp_result_text = None
+        self.last_grasp_results = []
+        self.last_grasp_result = None
+        self.handeye_calib_window = None
+        self.handeye_samples = []
+        
         # Tạo giao diện
         self.create_widgets()
         
@@ -117,7 +201,7 @@ class RealSenseGUI:
     def load_yolo_model(self):
         """Load YOLOv8 segmentation model"""
         try:
-            model_path = os.path.join(os.path.dirname(__file__), 'v8m-seg-832.pt')
+            model_path = os.path.join(os.path.dirname(__file__), 'best.pt')
             if os.path.exists(model_path):
                 print(f"Loading YOLO model: {model_path}")
                 self.yolo_model = YOLO(model_path)
@@ -292,6 +376,21 @@ class RealSenseGUI:
         self.btn_save_parts_mam = ttk.Button(control_frame, text="📷 Lưu từng phần",
                                               command=self.save_parts_mam, width=15)
         self.btn_save_parts_mam.grid(row=2, column=3, padx=5, pady=5)
+        
+        # 🆕 HYBRID 2D-3D GRASP PIPELINE + Hand-Eye Calibration - Row 3
+        self.btn_hybrid_grasp = ttk.Button(control_frame, text="🤖 Tính Grasp Pose (Hybrid 2D-3D)",
+                                            command=self.run_hybrid_grasp_pipeline, width=32)
+        self.btn_hybrid_grasp.grid(row=3, column=0, columnspan=2, padx=5, pady=5)
+        
+        self.btn_handeye_calib = ttk.Button(control_frame, text="🛠️ Hiệu chỉnh Camera-Robot",
+                                             command=self.open_handeye_calibration_window, width=26)
+        self.btn_handeye_calib.grid(row=3, column=2, columnspan=2, padx=5, pady=5)
+        
+        self.handeye_status_label = ttk.Label(
+            control_frame,
+            text="🛠️ Hand-eye: " + (self.handeye_note if self.T_B_C is not None else "Chưa hiệu chỉnh"),
+            style='Dark.TLabel', foreground='yellow')
+        self.handeye_status_label.grid(row=3, column=4, columnspan=4, padx=5, pady=5, sticky=tk.W)
         
         # Frame cấu hình chất lượng
         quality_frame = ttk.LabelFrame(main_frame, text="⚙️ Cấu hình Chất lượng Point Cloud", padding="10", style='Dark.TLabelframe')
@@ -568,14 +667,45 @@ class RealSenseGUI:
             self.status_label.config(text=f"🔴 Lỗi camera: {str(e)}", foreground='red')
             print(f"Lỗi khởi động camera: {e}")
     
+    def _set_preview_active(self, active, update_checkbox=None):
+        """
+        Bật/tắt preview MỘT CÁCH ĐỒNG BỘ:
+        - self.is_preview: cờ trạng thái (đọc ở nhiều nơi).
+        - self.preview_event: threading.Event để thread preview NGỦ (event.wait())
+          thay vì busy-loop (continue liên tục) khi bị tắt.
+        - preview_var (checkbox GUI): mặc định chỉ tự cập nhật khi RESUME (active=True),
+          giữ đúng hành vi cũ (tạm dừng theo chương trình không đổi trạng thái checkbox).
+        """
+        self.is_preview = active
+        if active:
+            self.preview_event.set()
+        else:
+            self.preview_event.clear()
+        if update_checkbox is None:
+            update_checkbox = active
+        if update_checkbox:
+            try:
+                if hasattr(self, 'preview_var'):
+                    self.preview_var.set(active)
+            except Exception:
+                pass
+
     def update_frame(self):
         while self.is_running:
+            # 🔒 Ngủ (không busy-loop) khi preview bị tắt; wake dậy định kỳ
+            # (timeout=0.5s) để vẫn kiểm tra được self.is_running và thoát sạch.
+            if not self.preview_event.wait(timeout=0.5):
+                continue
+            if not self.is_running:
+                break
             try:
-                if not self.is_preview:
-                    continue
-                
-                frames = self.pipeline.wait_for_frames()
-                aligned_frames = self.align.process(frames)
+                # 🔒 Giữ camera_lock CHỈ trong lúc lấy + align frame (nhả ngay sau
+                # đó) để không chặn YOLO/point-cloud/GUI, đồng thời tránh 2 thread
+                # (preview + Hybrid/Pass1-2/hand-eye calib) gọi RealSense API
+                # đồng thời.
+                with self.camera_lock:
+                    frames = self.pipeline.wait_for_frames()
+                    aligned_frames = self.align.process(frames)
                 
                 depth_frame = aligned_frames.get_depth_frame()
                 color_frame = aligned_frames.get_color_frame()
@@ -1084,7 +1214,7 @@ class RealSenseGUI:
             time.sleep(0.01)  # 10ms
     
     def toggle_preview(self):
-        self.is_preview = self.preview_var.get()
+        self._set_preview_active(self.preview_var.get())
         if self.is_preview:
             self.status_label.config(text="🟢 Preview: BẬT", foreground='green')
         else:
@@ -1181,14 +1311,6 @@ class RealSenseGUI:
             self.status_label.config(text=msg, foreground='red')
             print(f"\n{msg}")
             import traceback; traceback.print_exc()
-        """Bật/tắt hiển thị màu mask overlay lên ảnh preview"""
-        self.show_mask_overlay = self.mask_overlay_var.get()
-        status = "BẬT" if self.show_mask_overlay else "TẮT"
-        self.status_label.config(text=f"🎨 Mask Overlay: {status}", foreground='cyan')
-        print(f"\n🎨 Mask Overlay: {status}")
-        if not self.show_mask_overlay:
-            # Khi tắt mask, reset overlay để hiển thị ảnh gốc ngay
-            self.last_detection_overlay = None
 
     # ────────────────── Lưu ảnh mầm ──────────────────
 
@@ -1512,7 +1634,7 @@ class RealSenseGUI:
         """Dừng threads trước khi mở Open3D viewer"""
         print("\n⏸️ Dừng camera threads...")
         self.is_running = False
-        self.is_preview = False
+        self._set_preview_active(False)
         
         # Đợi threads dừng
         import time
@@ -1522,8 +1644,7 @@ class RealSenseGUI:
         """Khởi động lại threads sau khi đóng viewer"""
         print("▶️ Khởi động lại camera threads...")
         self.is_running = True
-        self.is_preview = True
-        self.preview_var.set(True)
+        self._set_preview_active(True)
         
         # Tạo threads mới
         self.update_thread = threading.Thread(target=self.update_frame, daemon=True)
@@ -1579,7 +1700,7 @@ class RealSenseGUI:
             
             # Tạm dừng preview
             was_previewing = self.is_preview
-            self.is_preview = False
+            self._set_preview_active(False)
             self.root.update()
             
             import time
@@ -1601,8 +1722,9 @@ class RealSenseGUI:
                 
                 # Lấy 1 frame duy nhất
                 print("\n📸 Lấy 1 frame để tính nền...")
-                frames_bg = self.pipeline.wait_for_frames(timeout_ms=5000)
-                aligned_frames_bg = self.align.process(frames_bg)
+                with self.camera_lock:
+                    frames_bg = self.pipeline.wait_for_frames(timeout_ms=5000)
+                    aligned_frames_bg = self.align.process(frames_bg)
                 
                 depth_frame_bg = aligned_frames_bg.get_depth_frame()
                 color_frame_bg = aligned_frames_bg.get_color_frame()
@@ -1807,8 +1929,9 @@ class RealSenseGUI:
             depth_frame_ref = None
             
             for i in range(num_frames):
-                frames = self.pipeline.wait_for_frames(timeout_ms=5000)
-                aligned_frames = self.align.process(frames)
+                with self.camera_lock:
+                    frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+                    aligned_frames = self.align.process(frames)
                 
                 depth_frame = aligned_frames.get_depth_frame()
                 color_frame = aligned_frames.get_color_frame()
@@ -1841,8 +1964,7 @@ class RealSenseGUI:
             if len(depth_frames_list) == 0:
                 self.status_label.config(text="🔴 Lỗi: Không lấy được frame", foreground='red')
                 if was_previewing:
-                    self.is_preview = True
-                    self.preview_var.set(True)
+                    self._set_preview_active(True)
                 return
             
             t_capture_end = time.perf_counter()
@@ -2032,8 +2154,7 @@ class RealSenseGUI:
             if np.sum(valid_mask) == 0:
                 self.status_label.config(text="🔴 Không có điểm hợp lệ!", foreground='red')
                 if was_previewing:
-                    self.is_preview = True
-                    self.preview_var.set(True)
+                    self._set_preview_active(True)
                 return
             
             verts_filtered = verts[valid_mask]
@@ -2233,8 +2354,7 @@ class RealSenseGUI:
             
             # Bật lại preview
             if was_previewing:
-                self.is_preview = True
-                self.preview_var.set(True)
+                self._set_preview_active(True)
             
             # Xuất point cloud ra file thay vì hiển thị
             self.export_point_cloud_to_file(pcd)
@@ -2251,8 +2371,7 @@ class RealSenseGUI:
             # Đảm bảo bật lại preview nếu có lỗi
             try:
                 if was_previewing:
-                    self.is_preview = True
-                    self.preview_var.set(True)
+                    self._set_preview_active(True)
             except:
                 pass
     
@@ -2856,6 +2975,14 @@ class RealSenseGUI:
             pass
     
     # ==================== SKELETON & MULTIPLE TIPS DETECTION ====================
+    # ⚠️ LEGACY SECTION (giữ nguyên cho tính năng "🔬 XỬ LÝ & XUẤT POINT CLOUD"
+    # xuất point cloud toàn cảnh + trục sinh trưởng hiện có).
+    # Toàn bộ hàm từ đây tới marker "END GROWTH AXIS COMPUTATION" KHÔNG được
+    # gọi bởi HYBRID 2D-3D GRASP PIPELINE mới (xem cuối file, trước __main__).
+    # Pipeline mới không dùng: branch pruning 30px, retreat 4px, tip merge
+    # 40px/20mm, centerline slicing, cone filter 85° kiểu cũ, picking-frame
+    # kiểu cũ, v.v. theo đúng yêu cầu NOTE_Codex_Phuong_phap_MethodsX.
+    # ==============================================================================
     
     def preprocess_mask_binary(self, mask):
         """
@@ -6240,6 +6367,1587 @@ class RealSenseGUI:
         self.is_running = False
         if self.pipeline:
             self.pipeline.stop()
+
+    # ==========================================================================
+    # 🆕 HYBRID 2D-3D GRASP PIPELINE  (theo NOTE_Codex_Phuong_phap_MethodsX)
+    #
+    # instance mask + aligned depth + camera intrinsics
+    #   -> refined mask -> 2D skeleton graph -> mask-constrained 3D point cloud
+    #   -> skeleton-guided branch point clouds -> branch-wise PCA
+    #   -> 2D-3D fusion -> dominant growth axis -> grasp point -> 6-DoF grasp pose
+    #
+    # Đây là pipeline xử lý CHÍNH cho việc tính điểm/pose kẹp mầm. Không tái sử
+    # dụng các hàm "LEGACY" ở phần SKELETON & MULTIPLE TIPS DETECTION phía trên.
+    # ==========================================================================
+
+    # ---------------------- Section 1: Refine instance mask ----------------------
+    def hybrid_refine_mask(self, mask):
+        """Erosion(2) + Dilation(2) với kernel 3x3. Output: binary {0,1} uint8."""
+        cfg = self.pipeline_config['morphology']
+        mask01 = (mask > 0).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, tuple(cfg['kernel_size']))
+        refined = cv2.erode(mask01, kernel, iterations=cfg['erosion_iterations'])
+        refined = cv2.dilate(refined, kernel, iterations=cfg['dilation_iterations'])
+        return (refined > 0).astype(np.uint8)
+
+    # ---------------------- Section 2: Skeleton graph ----------------------
+    def hybrid_skeletonize_mask(self, mask01):
+        """Skeletonize refined mask -> skeleton rộng 1 pixel (boolean array)."""
+        return skeletonize(mask01.astype(bool))
+
+    def hybrid_node_degrees(self, skel_bool):
+        """Đếm số neighbor (8-connectivity) cho từng skeleton pixel = degree."""
+        skel_uint8 = skel_bool.astype(np.uint8)
+        kernel = np.array([[1, 1, 1],
+                            [1, 0, 1],
+                            [1, 1, 1]], dtype=np.uint8)
+        neighbor_count = cv2.filter2D(skel_uint8, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        neighbor_count = neighbor_count * skel_uint8
+        return neighbor_count
+
+    def hybrid_find_endpoints_junctions(self, skel_bool):
+        """Endpoint: degree==1. Junction: degree>2. Trả về list các tuple (row,col) int."""
+        degree_map = self.hybrid_node_degrees(skel_bool)
+        endpoints_mask = (degree_map == 1) & skel_bool
+        junctions_mask = (degree_map > 2) & skel_bool
+        endpoints_rc = [(int(r), int(c)) for r, c in np.column_stack(np.where(endpoints_mask))]
+        junctions_rc = [(int(r), int(c)) for r, c in np.column_stack(np.where(junctions_mask))]
+        return endpoints_rc, junctions_rc
+
+    def hybrid_select_basal_node(self, mask01, endpoints_rc):
+        """
+        Chọn basal node theo đúng 2 bước của spec:
+        1) Lọc candidates = các endpoint NẰM TRONG lower mask region (20% hàng
+           dưới cùng của mask) - KHÔNG xét endpoint nằm ngoài vùng này dù có thể
+           gần centroid hơn (ví dụ endpoint giữ hoặc trên của một thân cong).
+        2) Nếu có nhiều candidates, chọn endpoint gần centroid của lower region
+           nhất trong số candidates đó (KHÔNG so với toàn bộ endpoints).
+        KHÔNG dùng class/mask phụ/marker ngoài instance mask.
+        """
+        if len(endpoints_rc) == 0:
+            return None
+        ys, xs = np.where(mask01 > 0)
+        if len(ys) == 0:
+            return None
+        y_min, y_max = float(ys.min()), float(ys.max())
+        lower_threshold = y_max - 0.20 * (y_max - y_min)
+        lower_sel = ys >= lower_threshold
+        if np.sum(lower_sel) == 0:
+            lower_ys, lower_xs = ys, xs
+        else:
+            lower_ys, lower_xs = ys[lower_sel], xs[lower_sel]
+        centroid_r = float(np.mean(lower_ys))
+        centroid_c = float(np.mean(lower_xs))
+        
+        # Bước 1: chỉ giữ các endpoint thực sự nằm trong lower region
+        candidates = [e for e in endpoints_rc if e[0] >= lower_threshold]
+        if len(candidates) == 0:
+            # Không endpoint nào nằm trong lower region (mask bất thường) -> fallback
+            # toàn bộ endpoints, vẫn chọn theo khoảng cách tới centroid lower region.
+            candidates = endpoints_rc
+        
+        # Bước 2: trong số candidates, chọn endpoint gần centroid nhất
+        best_idx, best_dist = None, float('inf')
+        for idx, (r, c) in enumerate(candidates):
+            d = (r - centroid_r) ** 2 + (c - centroid_c) ** 2
+            if d < best_dist:
+                best_dist = d
+                best_idx = idx
+        return candidates[best_idx] if best_idx is not None else None
+
+    def hybrid_bfs_shortest_path(self, skel_bool, start_rc, end_rc):
+        """BFS shortest path (8-connectivity, unweighted) từ start_rc -> end_rc trên skeleton."""
+        h, w = skel_bool.shape
+        if not (0 <= start_rc[0] < h and 0 <= start_rc[1] < w and skel_bool[start_rc[0], start_rc[1]]):
+            return None
+        if start_rc == end_rc:
+            return [start_rc]
+        
+        visited = np.zeros_like(skel_bool, dtype=bool)
+        parent = {}
+        visited[start_rc[0], start_rc[1]] = True
+        queue = deque([start_rc])
+        offsets = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+        
+        reached = False
+        while queue:
+            r, c = queue.popleft()
+            if (r, c) == end_rc:
+                reached = True
+                break
+            for dr, dc in offsets:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and skel_bool[nr, nc] and not visited[nr, nc]:
+                    visited[nr, nc] = True
+                    parent[(nr, nc)] = (r, c)
+                    queue.append((nr, nc))
+        
+        if not reached and not visited[end_rc[0], end_rc[1]]:
+            return None
+        
+        path = [end_rc]
+        cur = end_rc
+        while cur != start_rc:
+            cur = parent.get(cur)
+            if cur is None:
+                return None
+            path.append(cur)
+        path.reverse()
+        return path
+
+    # ---------------------- Camera intrinsics helper ----------------------
+    def hybrid_get_intrinsics(self):
+        """Lấy fx,fy,cx,cy,coeffs,depth_scale + offset crop 720x720 (cache lại)."""
+        if self._intrinsics_cache is not None:
+            return self._intrinsics_cache
+        try:
+            profile = self.pipeline.get_active_profile()
+            color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            intr = color_stream.get_intrinsics()
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale = depth_sensor.get_depth_scale()
+            start_x = (intr.width - 720) // 2
+            self._intrinsics_cache = {
+                'fx': intr.fx, 'fy': intr.fy, 'cx': intr.ppx, 'cy': intr.ppy,
+                'coeffs': list(intr.coeffs), 'width': intr.width, 'height': intr.height,
+                'depth_scale': depth_scale, 'start_x': start_x, 'start_y': 0,
+            }
+            return self._intrinsics_cache
+        except Exception as e:
+            print(f"⚠️ Không lấy được camera intrinsics: {e}")
+            return None
+
+    # ---------------------- Section 3: Back-project mask -> point cloud ----------------------
+    def hybrid_backproject_mask(self, mask01, depth_image_m, intr):
+        """
+        Back-project MỌI foreground pixel (không subsample) có depth hợp lệ.
+        z = depth(u,v); x=(u-cx)*z/fx; y=(v-cy)*z/fy
+        Giữ mapping (u,v)_crop <-> point_C.
+        Trả về points_C (N,3) mét, pixel_uv (N,2) int32 tọa độ crop 720x720.
+        """
+        start_x, start_y = intr['start_x'], intr['start_y']
+        fx, fy, cx, cy = intr['fx'], intr['fy'], intr['cx'], intr['cy']
+        
+        vs, us = np.where(mask01 > 0)
+        if len(us) == 0:
+            return np.zeros((0, 3)), np.zeros((0, 2), dtype=np.int32)
+        
+        u_full = us + start_x
+        v_full = vs + start_y
+        
+        h_full, w_full = depth_image_m.shape
+        valid_bounds = (u_full >= 0) & (u_full < w_full) & (v_full >= 0) & (v_full < h_full)
+        us, vs = us[valid_bounds], vs[valid_bounds]
+        u_full, v_full = u_full[valid_bounds], v_full[valid_bounds]
+        
+        z = depth_image_m[v_full, u_full]
+        valid_depth = (z > 0) & np.isfinite(z)
+        
+        us, vs = us[valid_depth], vs[valid_depth]
+        u_full, v_full, z = u_full[valid_depth], v_full[valid_depth], z[valid_depth]
+        
+        x = (u_full.astype(np.float64) - cx) * z / fx
+        y = (v_full.astype(np.float64) - cy) * z / fy
+        
+        points_C = np.stack([x, y, z], axis=1)
+        pixel_uv = np.stack([us, vs], axis=1).astype(np.int32)
+        return points_C, pixel_uv
+
+    def hybrid_deproject_pixel(self, u, v, depth_image_m, intr, mask01=None, max_search_radius=8):
+        """
+        Deproject pixel (u,v) [tọa độ crop] sang 3D camera frame.
+        Policy rõ ràng khi thiếu depth: quét vành ring bán kính tăng dần (1..max)
+        để tìm điểm depth hợp lệ GẦN NHẤT. Không tạo tọa độ giả -> trả None nếu
+        không tìm thấy trong bán kính cho phép.
+        Nếu mask01 được truyền vào (refined instance mask), CHỈ chấp nhận các
+        pixel nằm TRONG mask đó - tránh lấy nhầm depth của nền/bàn/vật khác.
+        """
+        start_x, start_y = intr['start_x'], intr['start_y']
+        fx, fy, cx, cy = intr['fx'], intr['fy'], intr['cx'], intr['cy']
+        h_full, w_full = depth_image_m.shape
+        mask_h, mask_w = (mask01.shape if mask01 is not None else (None, None))
+        
+        def _try(u_c, v_c):
+            if mask01 is not None:
+                if not (0 <= v_c < mask_h and 0 <= u_c < mask_w) or mask01[v_c, u_c] == 0:
+                    return None
+            uf, vf = u_c + start_x, v_c + start_y
+            if 0 <= uf < w_full and 0 <= vf < h_full:
+                z = depth_image_m[vf, uf]
+                if z > 0 and np.isfinite(z):
+                    x = (uf - cx) * z / fx
+                    y = (vf - cy) * z / fy
+                    return np.array([x, y, z], dtype=np.float64)
+            return None
+        
+        pt = _try(u, v)
+        if pt is not None:
+            return pt
+        
+        for radius in range(1, max_search_radius + 1):
+            candidates = []
+            for du in range(-radius, radius + 1):
+                for dv in range(-radius, radius + 1):
+                    if max(abs(du), abs(dv)) != radius:
+                        continue
+                    pt = _try(u + du, v + dv)
+                    if pt is not None:
+                        candidates.append((du * du + dv * dv, pt))
+            if candidates:
+                candidates.sort(key=lambda item: item[0])
+                return candidates[0][1]
+        return None
+
+    # ---------------------- Section 4: Filter point cloud + supporting plane ----------------------
+    def hybrid_statistical_outlier_removal(self, points_C, pixel_uv):
+        """SOR (nb_neighbors=10, std_ratio=2.0). Giữ đồng bộ pixel_uv."""
+        cfg = self.pipeline_config['pointcloud']
+        if len(points_C) < cfg['sor_neighbors'] + 1:
+            return points_C, pixel_uv
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_C)
+        _, ind = pcd.remove_statistical_outlier(nb_neighbors=cfg['sor_neighbors'], std_ratio=cfg['sor_std_ratio'])
+        ind = np.array(ind, dtype=np.int64)
+        return points_C[ind], pixel_uv[ind]
+
+    def hybrid_validate_plane_model(self, plane_model, inlier_points, total_points=None,
+                                    min_inliers=3, eps=1e-9,
+                                    quality_min_inliers=None, quality_min_ratio=None):
+        """
+        Kiểm tra plane_model + inlier points theo 2 lớp độc lập (tập trung TOÀN
+        BỘ logic kiểm tra plane vào 1 hàm duy nhất - không lặp ở nơi khác):
+        
+        (A) Ràng buộc HÌNH HỌC tối thiểu (bắt buộc, không cấu hình được):
+            - 4 hệ số plane đều hữu hạn (không NaN/Inf).
+            - norm(normal) > eps (không suy biến về vector 0).
+            - >= min_inliers=3 điểm (điều kiện TOÁN HỌC tối thiểu để xác
+              định 1 mặt phẳng - KHÔNG phải ngưỡng chất lượng).
+            - Inliers không suy biến thành điểm trùng nhau / đường thẳng:
+              eigenvalue lớn thứ 2 của covariance phải > eps.
+        
+        (B) Kiểm tra CHẤT LƯỢNG supporting plane (TÙY CHỌN - chỉ áp dụng nếu
+            gọi hàm kèm total_points + quality_min_inliers/quality_min_ratio).
+            Một plane thỏa (A) nhưng chỉ được hỗ trợ bởi 1 phần rất nhỏ ROI
+            (ví dụ 5 điểm/50000) vẫn có thể làm xoay SAI toàn bộ point cloud
+            nếu không bị chặn ở đây.
+        
+        Trả về (is_valid, inlier_count, reason).
+        """
+        coeffs = np.asarray(plane_model, dtype=np.float64)
+        if coeffs.shape[0] != 4 or not np.all(np.isfinite(coeffs)):
+            return False, 0, 'Hệ số plane không hữu hạn (NaN/Inf) hoặc sai định dạng'
+        
+        normal_norm = np.linalg.norm(coeffs[:3])
+        if normal_norm <= eps:
+            return False, 0, 'Normal của plane suy biến (~0)'
+        
+        inlier_count = int(len(inlier_points))
+        if inlier_count < min_inliers:
+            return False, inlier_count, f'Quá ít inlier ({inlier_count} < {min_inliers}) - vi phạm ràng buộc hình học tối thiểu'
+        
+        centroid = np.mean(inlier_points, axis=0)
+        centered = inlier_points - centroid
+        cov = (centered.T @ centered) / inlier_count
+        if not np.all(np.isfinite(cov)):
+            return False, inlier_count, 'Covariance của inlier không hữu hạn'
+        
+        eigvals = np.sort(np.linalg.eigvalsh(cov))[::-1]
+        if eigvals[1] <= eps:
+            return False, inlier_count, 'Inliers suy biến (trùng nhau hoặc thẳng hàng)'
+        
+        # (B) Kiểm tra chất lượng - chỉ khi caller cung cấp total_points + ngưỡng
+        if total_points is not None and total_points > 0:
+            inlier_ratio = inlier_count / total_points
+            if quality_min_inliers is not None and inlier_count < quality_min_inliers:
+                return False, inlier_count, (
+                    f'Mức hỗ trợ plane quá thấp: inlier_count={inlier_count} < '
+                    f'ransac_min_inliers={quality_min_inliers} (tổng ROI={total_points}, '
+                    f'ratio={inlier_ratio:.3f})')
+            if quality_min_ratio is not None and inlier_ratio < quality_min_ratio:
+                return False, inlier_count, (
+                    f'Mức hỗ trợ plane quá thấp: inlier_ratio={inlier_ratio:.3f} < '
+                    f'ransac_min_inlier_ratio={quality_min_ratio} (inlier_count={inlier_count}/'
+                    f'{total_points})')
+        
+        return True, inlier_count, 'OK'
+
+    def hybrid_fit_supporting_plane(self, mask01, depth_image_m, intr, margin_px=60):
+        """
+        Fit supporting plane từ local ROI quanh bud (loại trừ chính mask).
+        RANSAC threshold=3mm, iterations=500 (Section 4).
+        Dùng CÙNG MỘT seed (config['ransac_seed'], mặc định 0) cho cả:
+          - NumPy sampling ROI khi >8000 điểm (np.random.default_rng(seed)), và
+          - RNG nội bộ của Open3D (o3d.utility.random.seed(seed)) dùng bởi
+            pcd_roi.segment_plane() - đây là bộ sinh ngẫu nhiên RIÊNG, không
+            chia sẻ với NumPy, nên phải cố định seed của chính nó thì kết quả
+            RANSAC mới lặp lại ổn định qua các lần chạy.
+        Trả về plane_model (a,b,c,d) camera frame, hoặc None nếu validation thất
+        bại (KHÔNG fallback âm thầm sang identity rotation).
+        """
+        cfg = self.pipeline_config['pointcloud']
+        ys, xs = np.where(mask01 > 0)
+        if len(ys) == 0:
+            return None
+        y0, y1 = max(0, ys.min() - margin_px), min(mask01.shape[0], ys.max() + margin_px)
+        x0, x1 = max(0, xs.min() - margin_px), min(mask01.shape[1], xs.max() + margin_px)
+        
+        roi_mask = np.zeros_like(mask01, dtype=bool)
+        roi_mask[y0:y1, x0:x1] = True
+        roi_mask &= (mask01 == 0)
+        
+        points_roi, _ = self.hybrid_backproject_mask(roi_mask.astype(np.uint8), depth_image_m, intr)
+        
+        if len(points_roi) < 50:
+            print("      ⚠️ ROI nền quanh bud quá ít điểm, bỏ qua supporting plane fit")
+            return None
+        
+        seed = int(cfg.get('ransac_seed', 0))
+        
+        if len(points_roi) > 8000:
+            # 🔒 Sampling XÁC ĐỊNH (deterministic): dùng chung seed với RANSAC,
+            # KHÔNG dùng np.random.choice() toàn cục (kết quả sẽ thay đổi giữa
+            # các lần chạy).
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(points_roi), 8000, replace=False)
+            points_roi_sampled = points_roi[idx]
+        else:
+            points_roi_sampled = points_roi
+        
+        pcd_roi = o3d.geometry.PointCloud()
+        pcd_roi.points = o3d.utility.Vector3dVector(points_roi_sampled)
+        
+        try:
+            # 🔒 Cố định RNG NỘI BỘ của Open3D (segment_plane dùng RANSAC ngẫu nhiên
+            # riêng, không chia sẻ với numpy) - cùng seed để kết quả lặp lại ổn
+            # định qua các lần chạy trong cùng môi trường Open3D.
+            o3d.utility.random.seed(seed)
+            plane_model, inliers = pcd_roi.segment_plane(
+                distance_threshold=cfg['ransac_threshold_mm'] / 1000.0,
+                ransac_n=3,
+                num_iterations=cfg['ransac_iterations'],
+                probability=1.0
+            )
+        except Exception as e:
+            print(f"      ⚠️ RANSAC plane fit thất bại: {e}")
+            return None
+        
+        inlier_points = points_roi_sampled[inliers] if len(inliers) > 0 else np.zeros((0, 3))
+        is_valid, inlier_count, reason = self.hybrid_validate_plane_model(
+            plane_model, inlier_points,
+            total_points=len(points_roi_sampled),
+            quality_min_inliers=cfg.get('ransac_min_inliers'),
+            quality_min_ratio=cfg.get('ransac_min_inlier_ratio'),
+        )
+        inlier_ratio = inlier_count / len(points_roi_sampled) if len(points_roi_sampled) > 0 else 0.0
+        
+        print(f"      ℹ️ Plane fit: inlier_count={inlier_count}/{len(points_roi_sampled)} "
+              f"(inlier_ratio={inlier_ratio:.3f})")
+        
+        if not is_valid:
+            print(f"      ⚠️ Plane bị từ chối (validation thất bại): {reason}")
+            return None
+        
+        return plane_model
+
+    def hybrid_remove_plane_inliers(self, points_C, pixel_uv, plane_model, threshold_mm):
+        """Áp dụng plane equation lên dense pixel-mapped cloud, loại bỏ điểm gần plane."""
+        a, b, c, d = plane_model
+        norm = np.sqrt(a * a + b * b + c * c)
+        if norm < 1e-9:
+            return points_C, pixel_uv
+        dist = np.abs(a * points_C[:, 0] + b * points_C[:, 1] + c * points_C[:, 2] + d) / norm
+        keep = dist > (threshold_mm / 1000.0)
+        return points_C[keep], pixel_uv[keep]
+
+    # ---------------------- Section 5: Chuẩn hóa mặt phẳng (rotation-only) ----------------------
+    def hybrid_compute_plane_rotation(self, plane_model):
+        """
+        Tính R_N_C sao cho R_N_C @ plane_normal_C = [0,0,1]. Chỉ rotation, không
+        translate. Đảm bảo trực chuẩn, det(R)=+1.
+        """
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c], dtype=np.float64)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-9:
+            return np.eye(3)
+        normal = normal / norm_len
+        if normal[2] < 0:
+            normal = -normal
+        
+        target_z = np.array([0.0, 0.0, 1.0])
+        v = np.cross(normal, target_z)
+        s = np.linalg.norm(v)
+        c_val = np.dot(normal, target_z)
+        
+        if s < 1e-9:
+            if c_val > 0:
+                R = np.eye(3)
+            else:
+                R = np.diag([1.0, -1.0, -1.0])  # xoay 180° quanh trục X, det=+1
+        else:
+            vx = np.array([[0, -v[2], v[1]],
+                           [v[2], 0, -v[0]],
+                           [-v[1], v[0], 0]])
+            R = np.eye(3) + vx + vx.dot(vx) * ((1 - c_val) / (s * s))
+        return R
+
+    # ---------------------- Section 6: Gán point cho branch (pixel domain, 5px) ----------------------
+    def hybrid_assign_points_to_branches(self, points_N, pixel_uv, branch_paths):
+        """
+        Với mỗi point còn pixel mapping (u,v), gán cho basal-to-endpoint path gần
+        nhất (pixel Euclidean distance) nếu < support_radius_px (5px).
+        Thực hiện TRƯỚC voxel downsampling. overlap_policy = nearest_path.
+        """
+        cfg = self.pipeline_config['branch']
+        support_radius = cfg['support_radius_px']
+        
+        if len(branch_paths) == 0 or len(points_N) == 0:
+            return []
+        
+        trees = []
+        for path in branch_paths:
+            path_uv = np.array([[c, r] for (r, c) in path], dtype=np.float64)  # (u,v)
+            trees.append(cKDTree(path_uv))
+        
+        query_uv = pixel_uv.astype(np.float64)
+        n_branches = len(trees)
+        n_points = len(query_uv)
+        dist_matrix = np.full((n_points, n_branches), np.inf)
+        
+        for bi, tree in enumerate(trees):
+            d, _ = tree.query(query_uv, k=1)
+            dist_matrix[:, bi] = d
+        
+        # ℹ️ TIE-BREAK: np.argmin() trả về index NHỎ NHẤT khi có nhiều branch có
+        # cùng khoảng cách tối thiểu (hòa tuyệt đối). Đây CHỈ là quy tắc xác định
+        # (deterministic) để mỗi point luôn được gán cho ĐÚNG MỘT branch duy nhất
+        # (không nhân bản), KHÔNG phải tiêu chí chọn dominant branch - việc chọn
+        # dominant branch vẫn hoàn toàn dựa trên theta<=85° + longest-path ở
+        # hybrid_select_dominant_branch(). Thứ tự branch (và do đó kết quả
+        # tie-break) đã được cố định bằng cách sắp xếp candidate endpoint theo
+        # tọa độ pixel (row, col) trước khi tạo branch_paths.
+        best_branch = np.argmin(dist_matrix, axis=1)
+        best_dist = dist_matrix[np.arange(n_points), best_branch]
+        assigned_mask = best_dist < support_radius
+        
+        branches_out = []
+        for bi in range(n_branches):
+            sel = assigned_mask & (best_branch == bi)
+            if np.sum(sel) == 0:
+                continue
+            branches_out.append({
+                'branch_index': bi,
+                'points_N': points_N[sel],
+                'pixel_uv': pixel_uv[sel],
+            })
+        return branches_out
+
+    def hybrid_voxel_downsample_branch(self, points_N):
+        """Voxel-downsample riêng point cloud của 1 branch (0.5mm), SAU assignment."""
+        voxel_size = self.pipeline_config['pointcloud']['voxel_size_mm'] / 1000.0
+        if len(points_N) == 0:
+            return points_N
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_N)
+        pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
+        return np.asarray(pcd_down.points)
+
+    # ---------------------- Section 7: Branch-wise PCA ----------------------
+    def hybrid_branch_pca(self, points_N):
+        """PCA trên point cloud (normalized frame) của 1 branch. Reject nếu suy biến."""
+        if points_N is None or len(points_N) < 3:
+            return None
+        centroid = np.mean(points_N, axis=0)
+        centered = points_N - centroid
+        cov = (centered.T @ centered) / len(centered)
+        if not np.all(np.isfinite(cov)):
+            return None
+        try:
+            eigvals, eigvecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(eigvals)) or not np.all(np.isfinite(eigvecs)):
+            return None
+        order = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[order]
+        eigvecs = eigvecs[:, order]
+        
+        # ⚠️ Suy biến: các điểm trùng nhau hoặc không có độ trải (eigenvalue lớn
+        # nhất ~ 0) thì eigh() vẫn trả eigenvector đơn vị hợp lệ về mặt số học
+        # nhưng huớng hoàn toàn không có ý nghĩa -> phải reject rõ ràng.
+        max_eigval = eigvals[0]
+        if not np.isfinite(max_eigval) or max_eigval < 1e-12:
+            return None
+        
+        direction = eigvecs[:, 0]
+        norm = np.linalg.norm(direction)
+        if norm < 1e-9 or not np.all(np.isfinite(direction)):
+            return None
+        direction = direction / norm
+        if not np.all(np.isfinite(direction)):
+            return None
+        return direction
+
+    # ---------------------- Tăng độ tin cậy: lookup basal/endpoint TỪ mapping đã lọc ----------------------
+    def hybrid_lookup_point_from_mapping(self, u, v, filtered_points_C, filtered_pixel_uv, mask01=None, max_search_radius=8):
+        """
+        Tìm point 3D (camera frame) cho pixel (u,v) TỪ MAPPING ĐÃ LỌC (sau
+        back-projection + SOR + plane-inlier removal) - KHÔNG deproject lại từ
+        depth thô. Raw depth có thể chứa outlier đã bị SOR/plane-removal loại
+        khỏi point cloud, nên basal/endpoint dùng để tính skeleton direction và
+        grasp point PHẢI lấy từ chính filtered_points_C để đồng bộ với phần còn
+        lại của pipeline.
+        
+        1) Ưu tiên match CHÍNH XÁC pixel (u,v) trong filtered_pixel_uv.
+        2) Nếu không có, tìm pixel hợp lệ GẦN NHẤT trong filtered_pixel_uv
+           (trong bán kính max_search_radius px); nếu truyền mask01, candidate
+           đó phải còn nằm trong refined bud mask.
+        3) Trả về point từ filtered_points_C tương ứng - KHÔNG fabricate/deproject.
+        4) Trả None nếu không tìm được match hợp lệ trong bán kính cho phép
+           (branch gọi hàm này phải tự loại bỏ, KHÔNG fallback sang depth thô).
+        """
+        if filtered_pixel_uv is None or len(filtered_pixel_uv) == 0:
+            return None
+        
+        # 1) Exact match
+        exact = (filtered_pixel_uv[:, 0] == u) & (filtered_pixel_uv[:, 1] == v)
+        if np.any(exact):
+            return np.mean(filtered_points_C[exact], axis=0)
+        
+        # 2) Tìm lân cận trong bán kính cho phép
+        diffs = filtered_pixel_uv.astype(np.float64) - np.array([u, v], dtype=np.float64)
+        dist2 = diffs[:, 0] ** 2 + diffs[:, 1] ** 2
+        within_radius = dist2 <= (max_search_radius ** 2)
+        
+        if mask01 is not None:
+            pu = filtered_pixel_uv[:, 0]
+            pv = filtered_pixel_uv[:, 1]
+            h, w = mask01.shape[:2]
+            valid_coords = (pu >= 0) & (pu < w) & (pv >= 0) & (pv < h)
+            mask_ok = np.zeros(len(filtered_pixel_uv), dtype=bool)
+            valid_idx = np.where(valid_coords)[0]
+            mask_ok[valid_idx] = mask01[pv[valid_idx], pu[valid_idx]] > 0
+            within_radius &= mask_ok
+        
+        if not np.any(within_radius):
+            return None
+        
+        candidate_idx = np.where(within_radius)[0]
+        nearest_idx = candidate_idx[np.argmin(dist2[candidate_idx])]
+        return filtered_points_C[nearest_idx]
+
+    # ---------------------- Section 8: Skeleton direction + align dấu PCA ----------------------
+    def hybrid_compute_skeleton_direction(self, basal_rc, endpoint_rc, filtered_points_C, filtered_pixel_uv, R_N_C, mask01=None):
+        """Deproject basal & endpoint pixel -> normalized frame -> direction basal->endpoint.
+        🔒 Dùng mapping point cloud ĐÃ LỌC (sau SOR + plane-inlier removal) qua
+        hybrid_lookup_point_from_mapping() thay vì deproject lại depth thô -
+        tránh dùng nhầm điểm outlier đã bị loại khỏi point cloud.
+        mask01: refined instance mask - giới hạn candidate KHÔNG rò rỉ sang nền/vật khác.
+        """
+        basal_u, basal_v = basal_rc[1], basal_rc[0]
+        end_u, end_v = endpoint_rc[1], endpoint_rc[0]
+        
+        basal_C = self.hybrid_lookup_point_from_mapping(basal_u, basal_v, filtered_points_C, filtered_pixel_uv, mask01=mask01)
+        end_C = self.hybrid_lookup_point_from_mapping(end_u, end_v, filtered_points_C, filtered_pixel_uv, mask01=mask01)
+        
+        if basal_C is None or end_C is None:
+            return None, basal_C, end_C
+        
+        basal_N = R_N_C @ basal_C
+        end_N = R_N_C @ end_C
+        
+        direction = end_N - basal_N
+        norm = np.linalg.norm(direction)
+        if norm < 1e-9:
+            return None, basal_C, end_C
+        return direction / norm, basal_C, end_C
+
+    # ---------------------- Section 9: Fusion 2D-3D ----------------------
+    def hybrid_fuse_directions(self, d_pca_N, d_skeleton_N):
+        """alpha=0.6 cho PCA, 0.4 cho skeleton. Align dấu PCA theo skeleton trước khi fuse."""
+        alpha = self.pipeline_config['fusion']['alpha']
+        if np.dot(d_pca_N, d_skeleton_N) < 0:
+            d_pca_N = -d_pca_N
+        d_fused = alpha * d_pca_N + (1 - alpha) * d_skeleton_N
+        norm = np.linalg.norm(d_fused)
+        if norm < 1e-9:
+            return None, d_pca_N
+        return d_fused / norm, d_pca_N
+
+    # ---------------------- Section 10: Consistency + dominant branch ----------------------
+    def hybrid_select_dominant_branch(self, branch_records):
+        """
+        1) Chỉ xét branch hợp lệ (đã lọc trước).
+        2) Giữ branch theta<=85°.
+        3) Chọn path dài nhất trong số đó.
+        4) Nếu không có branch nào <=85° -> chọn valid path dài nhất.
+        5) Không có valid branch -> None (failure rõ ràng).
+        """
+        theta_max = self.pipeline_config['fusion']['theta_max_deg']
+        if len(branch_records) == 0:
+            return None
+        within_theta = [b for b in branch_records if b['theta_deg'] <= theta_max]
+        if within_theta:
+            return max(within_theta, key=lambda b: b['path_length_px'])
+        return max(branch_records, key=lambda b: b['path_length_px'])
+
+    # ---------------------- Section 11: Grasp point ----------------------
+    def hybrid_compute_grasp_point(self, basal_point_C, filtered_points_C):
+        """Centroid của các filtered bud points (camera frame) trong bán kính 8mm quanh basal."""
+        radius_m = self.pipeline_config['grasp']['basal_radius_mm'] / 1000.0
+        if basal_point_C is None or len(filtered_points_C) == 0:
+            return None
+        dist = np.linalg.norm(filtered_points_C - basal_point_C, axis=1)
+        neighborhood = filtered_points_C[dist <= radius_m]
+        if len(neighborhood) == 0:
+            return None
+        return np.mean(neighborhood, axis=0)
+
+    # ---------------------- Section 12: Local grasp frame ----------------------
+    def hybrid_build_grasp_frame(self, axis_C, grasp_point_C):
+        """
+        Growth axis = local Z. Nếu reference [0,0,1] gần song song axis, đổi basis khác.
+        Đảm bảo R_C_G trực chuẩn, det=+1.
+        """
+        if axis_C is None or grasp_point_C is None:
+            return None, None
+        z_g = axis_C / (np.linalg.norm(axis_C) + 1e-12)
+        ref = np.array(self.pipeline_config['grasp']['camera_reference_axis'], dtype=np.float64)
+        
+        if abs(np.dot(ref, z_g)) > 0.98:
+            alt = np.array([1.0, 0.0, 0.0])
+            ref = alt if abs(np.dot(alt, z_g)) <= 0.98 else np.array([0.0, 1.0, 0.0])
+        
+        x_g = np.cross(ref, z_g)
+        x_norm = np.linalg.norm(x_g)
+        if x_norm < 1e-9:
+            return None, None
+        x_g = x_g / x_norm
+        y_g = np.cross(z_g, x_g)
+        y_g = y_g / (np.linalg.norm(y_g) + 1e-12)
+        
+        R_C_G = np.column_stack([x_g, y_g, z_g])
+        if np.linalg.det(R_C_G) < 0:
+            x_g = -x_g
+            R_C_G = np.column_stack([x_g, y_g, z_g])
+        
+        T_C_G = np.eye(4)
+        T_C_G[:3, :3] = R_C_G
+        T_C_G[:3, 3] = grasp_point_C
+        return R_C_G, T_C_G
+
+    def hybrid_rotation_matrix_to_rotvec(self, R):
+        """Rotation matrix -> rotation vector (rad), quy ước kiểu Universal Robots (x,y,z,rx,ry,rz)."""
+        rotvec, _ = cv2.Rodrigues(R.astype(np.float64))
+        return rotvec.flatten()
+
+    # ---------------------- ORCHESTRATOR: toàn bộ Sections 1-12 cho 1 instance ----------------------
+    def compute_grasp_pose_hybrid(self, mask_crop, depth_image_m, intr):
+        """
+        MAIN HYBRID 2D-3D PIPELINE cho 1 instance mask.
+        mask_crop: (720,720) uint8, tọa độ crop.
+        depth_image_m: depth full-resolution (mét), đã align với color.
+        intr: dict từ hybrid_get_intrinsics().
+        Trả về dict: success, reason, axis_C, grasp_point_C, R_C_G, T_C_G,
+                     branch_count, dominant_branch_len_px, num_points_bud
+        """
+        result = {
+            'success': False, 'reason': '', 'axis_C': None, 'grasp_point_C': None,
+            'R_C_G': None, 'T_C_G': None, 'branch_count': 0,
+            'dominant_branch_len_px': 0.0, 'num_points_bud': 0, 'mask_area': 0,
+            'global_pca_axis_N': None, 'global_pca_axis_C': None,
+        }
+        
+        # Section 1
+        mask01 = self.hybrid_refine_mask(mask_crop)
+        if np.sum(mask01) < 20:
+            result['reason'] = 'Mask quá nhỏ sau khi refine'
+            return result
+        result['mask_area'] = int(np.sum(mask01 > 0))
+        
+        # Section 2
+        skel_bool = self.hybrid_skeletonize_mask(mask01)
+        if not skel_bool.any():
+            result['reason'] = 'Skeleton rỗng'
+            return result
+        
+        endpoints_rc, _junctions_rc = self.hybrid_find_endpoints_junctions(skel_bool)
+        if len(endpoints_rc) < 2:
+            result['reason'] = f'Không đủ endpoints (tìm thấy {len(endpoints_rc)}, cần >=2)'
+            return result
+        
+        basal_rc = self.hybrid_select_basal_node(mask01, endpoints_rc)
+        if basal_rc is None:
+            result['reason'] = 'Không chọn được basal node'
+            return result
+        
+        other_endpoints = [e for e in endpoints_rc if e != basal_rc]
+        if len(other_endpoints) == 0:
+            result['reason'] = 'Không có endpoint nào khác basal'
+            return result
+        
+        # 🔒 SẮp xếp candidate endpoint theo tọa độ pixel (row, col) TRƯỜC khi
+        # tạo các basal-to-endpoint path -> đảm bảo thứ tự/index của
+        # branch_paths_all ỔN ĐỪNH giữa các lần chạy (không phụ thuộc thứ tự
+        # không tường minh của np.where/skeletonize). Điều này quan trọng vì
+        # np.argmin() trong hybrid_assign_points_to_branches() chọn branch đầu
+        # tiên khi có nhiều branch có khoảng cách bằng nhau (tie-break).
+        other_endpoints = sorted(other_endpoints, key=lambda rc: (rc[0], rc[1]))
+        
+        branch_paths_all = []
+        for ep in other_endpoints:
+            path = self.hybrid_bfs_shortest_path(skel_bool, basal_rc, ep)
+            if path is not None and len(path) >= 2:
+                branch_paths_all.append({'endpoint_rc': ep, 'path': path})
+        
+        if len(branch_paths_all) == 0:
+            result['reason'] = 'Không tìm được basal-to-endpoint path nào'
+            return result
+        
+        # Section 3
+        points_C, pixel_uv = self.hybrid_backproject_mask(mask01, depth_image_m, intr)
+        if len(points_C) < 30:
+            result['reason'] = f'Quá ít điểm 3D hợp lệ ({len(points_C)})'
+            return result
+        
+        # Section 4
+        points_C, pixel_uv = self.hybrid_statistical_outlier_removal(points_C, pixel_uv)
+        if len(points_C) < 30:
+            result['reason'] = 'Quá ít điểm sau SOR'
+            return result
+        
+        plane_model = self.hybrid_fit_supporting_plane(mask01, depth_image_m, intr)
+        if plane_model is None:
+            # ⚠️ KHÔNG fallback âm thầm sang R_N_C=eye(3): nếu không fit được
+            # supporting plane, ta KHÔNG loại được điểm nền và KHÔNG chuẩn hóa
+            # được mount phẳng theo Section 5 -> trả failure rõ ràng thay vì tiếp
+            # tục với kết quả không đáng tin cậy.
+            result['reason'] = 'Không fit được supporting plane (RANSAC thất bại hoặc ROI nền quá ít điểm)'
+            return result
+        
+        ransac_thr_mm = self.pipeline_config['pointcloud']['ransac_threshold_mm']
+        points_C, pixel_uv = self.hybrid_remove_plane_inliers(points_C, pixel_uv, plane_model, ransac_thr_mm)
+        
+        if len(points_C) < 30:
+            result['reason'] = 'Quá ít điểm sau khi loại supporting plane'
+            return result
+        
+        result['num_points_bud'] = len(points_C)
+        
+        # Section 5
+        R_N_C = self.hybrid_compute_plane_rotation(plane_model)
+        R_C_N = R_N_C.T
+        points_N = (R_N_C @ points_C.T).T
+        
+        # 🆕 Global PCA (geometric reference của TOÀN BỘ bud, sau voxel-downsample
+        # 0.5mm) - CHỈ để tham khảo/chẩn đoán, KHÔNG thay thế branch-wise PCA,
+        # fused direction hay final growth axis. Dùng lại đúng logic kiểm tra suy
+        # biến (eigenvalue lớn nhất phải hữu hạn & dương) như branch-wise PCA.
+        global_points_N_ds = self.hybrid_voxel_downsample_branch(points_N)
+        global_pca_axis_N = self.hybrid_branch_pca(global_points_N_ds)
+        if global_pca_axis_N is not None:
+            global_pca_axis_C = R_C_N @ global_pca_axis_N
+            global_pca_axis_C = global_pca_axis_C / (np.linalg.norm(global_pca_axis_C) + 1e-12)
+        else:
+            global_pca_axis_C = None
+        result['global_pca_axis_N'] = global_pca_axis_N
+        result['global_pca_axis_C'] = global_pca_axis_C
+        
+        # Section 6 (assignment trước voxel downsample)
+        branch_paths_px = [b['path'] for b in branch_paths_all]
+        branches_assigned = self.hybrid_assign_points_to_branches(points_N, pixel_uv, branch_paths_px)
+        if len(branches_assigned) == 0:
+            result['reason'] = 'Không có branch nào có điểm được gán'
+            return result
+        
+        # Sections 7-9 cho từng branch (voxel downsample -> min_branch_points check -> PCA -> skeleton dir -> fusion)
+        min_branch_points = self.pipeline_config['branch']['min_branch_points']
+        branch_records = []
+        for ba in branches_assigned:
+            bi = ba['branch_index']
+            pts_branch_N = self.hybrid_voxel_downsample_branch(ba['points_N'])
+            if len(pts_branch_N) < min_branch_points:
+                continue
+            
+            d_pca_N = self.hybrid_branch_pca(pts_branch_N)
+            if d_pca_N is None:
+                continue
+            
+            endpoint_rc = branch_paths_all[bi]['endpoint_rc']
+            path_px = branch_paths_all[bi]['path']
+            
+            d_skel_N, basal_C_pt, _end_C_pt = self.hybrid_compute_skeleton_direction(
+                basal_rc, endpoint_rc, points_C, pixel_uv, R_N_C, mask01=mask01
+            )
+            if d_skel_N is None:
+                continue
+            
+            d_fused_N, d_pca_aligned_N = self.hybrid_fuse_directions(d_pca_N, d_skel_N)
+            if d_fused_N is None:
+                continue
+            
+            theta = float(np.degrees(np.arccos(np.clip(np.dot(d_pca_aligned_N, d_skel_N), -1.0, 1.0))))
+            
+            branch_records.append({
+                'branch_index': bi,
+                'path_length_px': len(path_px),
+                'd_fused_N': d_fused_N,
+                'theta_deg': theta,
+                'basal_C': basal_C_pt,
+            })
+        
+        if len(branch_records) == 0:
+            result['reason'] = 'Không có branch hợp lệ sau PCA/skeleton-direction'
+            return result
+        
+        # Section 10
+        dominant = self.hybrid_select_dominant_branch(branch_records)
+        if dominant is None:
+            result['reason'] = 'Không chọn được dominant branch'
+            return result
+        
+        axis_C = R_C_N @ dominant['d_fused_N']
+        axis_C = axis_C / (np.linalg.norm(axis_C) + 1e-12)
+        
+        # Section 11
+        basal_point_C = dominant['basal_C']
+        if basal_point_C is None:
+            # 🔒 Dùng mapping đã lọc (KHÔNG deproject lại depth thô) - nhánh này
+            # chỉ là fallback phòng thủ (về lý thuyết không xảy ra vì dominant
+            # đã được chọn từ branch_records luôn có basal_C hợp lệ).
+            basal_point_C = self.hybrid_lookup_point_from_mapping(basal_rc[1], basal_rc[0], points_C, pixel_uv, mask01=mask01)
+        if basal_point_C is None:
+            result['reason'] = 'Không deproject được basal point'
+            return result
+        
+        grasp_point_C = self.hybrid_compute_grasp_point(basal_point_C, points_C)
+        if grasp_point_C is None:
+            result['reason'] = 'Vùng lân cận basal (8mm) rỗng, không tính được grasp point'
+            return result
+        
+        # Section 12
+        R_C_G, T_C_G = self.hybrid_build_grasp_frame(axis_C, grasp_point_C)
+        if R_C_G is None:
+            result['reason'] = 'Không xây dựng được grasp frame (axis song song reference)'
+            return result
+        
+        result.update({
+            'success': True, 'reason': 'OK', 'axis_C': axis_C, 'grasp_point_C': grasp_point_C,
+            'R_C_G': R_C_G, 'T_C_G': T_C_G, 'branch_count': len(branch_records),
+            'dominant_branch_len_px': dominant['path_length_px'],
+        })
+        return result
+
+    # ---------------------- Capture đồng bộ mask + depth cho pipeline mới ----------------------
+    def hybrid_capture_instances_and_depth(self):
+        """
+        Chụp 1 frame MỚI, chạy YOLO ngay trên frame đó để mask & depth luôn đồng
+        bộ tuyệt đối (tránh lệch giữa 2 frame khác nhau).
+        Trả về (masks01_list, classes_list, depth_image_m, intr) hoặc None nếu lỗi.
+        """
+        if self.yolo_model is None:
+            self.status_label.config(text="⚠️ Chưa load YOLO model!", foreground='red')
+            return None
+        
+        intr = self.hybrid_get_intrinsics()
+        if intr is None:
+            self.status_label.config(text="⚠️ Không lấy được camera intrinsics!", foreground='red')
+            return None
+        
+        try:
+            with self.camera_lock:
+                frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+                aligned_frames = self.align.process(frames)
+            depth_frame = aligned_frames.get_depth_frame()
+            color_frame = aligned_frames.get_color_frame()
+            if not depth_frame or not color_frame:
+                self.status_label.config(text="⚠️ Không lấy được frame!", foreground='red')
+                return None
+            
+            if self.use_filters:
+                if self.decimation_filter:
+                    depth_frame = self.decimation_filter.process(depth_frame)
+                depth_frame = self.spatial_filter.process(depth_frame)
+                depth_frame = self.temporal_filter.process(depth_frame)
+                depth_frame = self.hole_filling.process(depth_frame)
+            
+            depth_raw = np.asanyarray(depth_frame.get_data()).astype(np.float64)
+            depth_image_m = depth_raw * intr['depth_scale']
+            
+            color_image = np.asanyarray(color_frame.get_data())
+            start_x = intr['start_x']
+            color_720 = color_image[0:720, start_x:start_x + 720].copy()
+            
+            if self.roi:
+                x1, y1, x2, y2 = self.roi
+                detection_region = color_720[y1:y2, x1:x2].copy()
+                region_offset = (x1, y1)
+            else:
+                detection_region = color_720.copy()
+                region_offset = (0, 0)
+            
+            if detection_region.shape[0] <= 32 or detection_region.shape[1] <= 32:
+                self.status_label.config(text="⚠️ Vùng detection quá nhỏ!", foreground='red')
+                return None
+            
+            results = self.yolo_model.predict(detection_region, conf=self.segmentation_conf, verbose=False)
+            
+            masks01_list, classes_list = [], []
+            if results and len(results) > 0 and results[0].masks is not None:
+                masks = results[0].masks.data.cpu().numpy()
+                boxes = results[0].boxes.data.cpu().numpy()
+                proc_h, proc_w = detection_region.shape[:2]
+                x_off, y_off = region_offset
+                
+                for mask, box in zip(masks, boxes):
+                    class_id = int(box[5])
+                    mask_resized = cv2.resize(mask, (proc_w, proc_h))
+                    mask_bool = mask_resized > 0.5
+                    
+                    full_mask01 = np.zeros((720, 720), dtype=np.uint8)
+                    full_mask01[y_off:y_off + proc_h, x_off:x_off + proc_w] = mask_bool.astype(np.uint8)
+                    
+                    masks01_list.append(full_mask01)
+                    classes_list.append(class_id)
+            
+            return masks01_list, classes_list, depth_image_m, intr
+        
+        except Exception as e:
+            print(f"❌ Lỗi capture instance/depth cho hybrid pipeline: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _select_grasp_target(self, success_results):
+        """
+        Chọn 1 instance DUY NHẤT để gửi robot - KHÔNG tự chọn theo mask_area
+        hay bất kỳ tiêu chí "lớn nhất" nào (không thuộc phương pháp trong bản
+        thảo). Chỉ trả về 1 instance khi:
+          a) `pipeline_config['grasp']['target_instance_index']` được chỉ định
+             rõ ràng (bởi ROI/người dùng/lệnh ngoài), hoặc
+          b) chỉ có ĐÚNG 1 instance thành công (không phải "chọn", chỉ vì đó
+             là lựa chọn duy nhất).
+        Nếu có nhiều instance hợp lệ mà chưa chỉ định target rõ ràng, trả về
+        None (KHÔNG tự chọn).
+        
+        Trả về (selected_result_or_None, log_messages: list[str]).
+        """
+        target_instance_index = self.pipeline_config['grasp'].get('target_instance_index')
+        logs = []
+        
+        if target_instance_index is not None:
+            matches = [r for r in success_results if r['instance_index'] == target_instance_index]
+            if matches:
+                return matches[0], logs
+            logs.append(f"⚠️ target_instance_index={target_instance_index} không nằm trong danh sách "
+                         f"instance thành công -> KHÔNG gán last_grasp_result.")
+            return None, logs
+        
+        if len(success_results) == 1:
+            return success_results[0], logs
+        
+        logs.append(f"ℹ️ Có {len(success_results)} instance hợp lệ nhưng CHƯA chỉ định target "
+                    f"(pipeline_config['grasp']['target_instance_index']) -> KHÔNG tự chọn, "
+                    f"KHÔNG gán last_grasp_result. Xem cửa sổ kết quả để chọn thủ công.")
+        return None, logs
+
+    def _prompt_select_target_dialog(self, success_results):
+        """
+        Mở dialog MODAL cho người dùng chọn TƯỜNG MINH 1 instance (trong số các
+        instance có success=True) làm target khi có NHIỀU instance thành công.
+        
+        Quy ước hiển thị: số thứ tự bắt đầu từ 1 (displayed = internal_index+1),
+        khớp đúng với cửa sổ kết quả "Instance N". Nội bộ vẫn dùng instance_index
+        0-based, không trộn lẫn 2 quy ước.
+        
+        Trả về internal instance_index (0-based) người dùng chọn, hoặc None nếu
+        người dùng hủy/đóng cửa sổ (không chọn gì).
+        """
+        if not success_results:
+            return None
+        
+        result_holder = {'selected_index': None}
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("🎯 Chọn Target Instance để gửi lệnh Robot")
+        dialog.configure(bg='#2d2d30')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(
+            dialog,
+            text=f"Có {len(success_results)} instance tính pose THÀNH CÔNG.\n"
+                 f"Chọn ĐÚNG MỘT instance làm target để gửi lệnh kẹp cho robot\n"
+                 f"(các instance còn lại chỉ hiển thị như candidate, KHÔNG gửi robot):",
+            style='Dark.TLabel', justify=tk.LEFT
+        ).pack(padx=15, pady=(15, 10))
+        
+        btn_frame = ttk.Frame(dialog, style='Dark.TFrame')
+        btn_frame.pack(padx=15, pady=5, fill=tk.X)
+        
+        def _choose(idx):
+            result_holder['selected_index'] = idx
+            dialog.destroy()
+        
+        # Chỉ liệt kê instance ĐANG success=True (không cho chọn instance thất bại)
+        for r in sorted(success_results, key=lambda x: x['instance_index']):
+            internal_idx = r['instance_index']
+            displayed_number = internal_idx + 1  # 🔢 quy ước hiển thị bắt đầu từ 1
+            btn_text = (f"Instance {displayed_number}   "
+                        f"(branches={r['branch_count']}, mask_area={r['mask_area']}px)")
+            ttk.Button(btn_frame, text=btn_text,
+                       command=lambda i=internal_idx: _choose(i)).pack(fill=tk.X, pady=3)
+        
+        ttk.Button(dialog, text="❌ Hủy (không chọn target nào)",
+                   command=dialog.destroy).pack(padx=15, pady=(8, 15), fill=tk.X)
+        
+        dialog.update_idletasks()
+        try:
+            x = self.root.winfo_x() + max(0, (self.root.winfo_width() - dialog.winfo_width()) // 2)
+            y = self.root.winfo_y() + max(0, (self.root.winfo_height() - dialog.winfo_height()) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        
+        self.root.wait_window(dialog)
+        return result_holder['selected_index']
+
+    # ---------------------- Nút bấm: chạy toàn bộ pipeline ----------------------
+    def run_hybrid_grasp_pipeline(self):
+        """Chạy HYBRID 2D-3D GRASP PIPELINE cho tất cả instance hiện tại, hiển thị
+        và lưu tọa độ x,y,z,rx,ry,rz để gửi lệnh kẹp cho robot."""
+        # 🔒 Xoá kết quả pose cũ NGAY Từ ĐẦU - trước bất kỳ lệnh nào có thể
+        # return/raise (không lấy được frame, không có detection, không có target
+        # class, exception...). Đảm bảo không bao giờ giữ lại pose của lần chạy
+        # trước nếu lần chạy mới thất bại.
+        self.last_grasp_results = []
+        self.last_grasp_result = None
+        
+        self.status_label.config(text="⏳ Đang tính Grasp Pose (Hybrid)...", foreground='orange')
+        self.root.update()
+        
+        was_previewing = self.is_preview
+        self._set_preview_active(False)
+        
+        try:
+            capture = self.hybrid_capture_instances_and_depth()
+            if capture is None:
+                self.status_label.config(text="🔴 Lỗi: Không lấy được dữ liệu detection", foreground='red')
+                return
+            
+            masks01_list, classes_list, depth_image_m, intr = capture
+            
+            if len(masks01_list) == 0:
+                self.status_label.config(text="⚠️ Không phát hiện instance nào!", foreground='orange')
+                return
+            
+            # 🆕 Chỉ xử lý đúng instance thuộc target_class_id (mặc định class 0 =
+            # "thân/nhánh" - đối tượng cần kẹp). Instance thuộc class khác (vd class 1
+            # = "gốc", chỉ là mốc tham chiếu) sẽ KHÔNG được đưa qua pipeline, tránh
+            # tạo pose sai cho đối tượng không phải target.
+            target_class_id = self.pipeline_config['grasp']['target_class_id']
+            target_indices = [i for i, c in enumerate(classes_list) if c == target_class_id]
+            
+            if len(target_indices) == 0:
+                self.status_label.config(
+                    text=f"⚠️ Không có instance nào thuộc target_class_id={target_class_id}!",
+                    foreground='orange')
+                return
+            
+            print(f"\n{'='*70}")
+            print(f"🤖 HYBRID 2D-3D GRASP PIPELINE - {len(target_indices)}/{len(masks01_list)} "
+                  f"instance thuộc target_class_id={target_class_id}")
+            print(f"{'='*70}")
+            
+            all_results = []
+            for idx in target_indices:
+                mask01, cls = masks01_list[idx], classes_list[idx]
+                print(f"\n🌿 Instance {idx+1} (class={cls}):")
+                res = self.compute_grasp_pose_hybrid(mask01, depth_image_m, intr)
+                res['instance_index'] = idx
+                res['class_id'] = cls
+                if res['success']:
+                    print(f"   ✅ Thành công! branches={res['branch_count']}, "
+                          f"mask_area={res['mask_area']}px, "
+                          f"grasp_point_C(mm)={np.round(res['grasp_point_C']*1000, 1)}")
+                else:
+                    print(f"   ❌ Thất bại: {res['reason']}")
+                all_results.append(res)
+            
+            self.last_grasp_results = all_results
+            success_results = [r for r in all_results if r['success']]
+            
+            if len(success_results) == 0:
+                self.status_label.config(text="🔴 Không có instance nào tính được grasp pose!", foreground='red')
+                self.last_grasp_result = None
+                self.show_grasp_result_window(all_results)
+                return
+            
+            # 🆕 KHÔNG tự chọn instance theo mask_area (không thuộc phương pháp
+            # trong bản thảo). Chỉ dùng 1 pose duy nhất khi:
+            #  a) target_instance_index được chỉ định rõ (ROI/người dùng/lệnh
+            #     ngoài) trong pipeline_config['grasp']['target_instance_index'], hoặc
+            #  b) chỉ có ĐÚNG 1 instance thành công (không phải "chọn" theo tiêu
+            #     chí nào, chỉ vì đó là lựa chọn duy nhất).
+            # Nếu có NHIỀU instance hợp lệ mà CHƯA có target chỉ định sẵn, mở
+            # DIALOG để NGƯỜI DÙNG chọn tường minh (chỉ áp dụng cho LẦN CHẠY
+            # HIỆN TẠI - không lưu lại cho lần chạy sau, vì layout instance có
+            # thể khác ở lần capture kế tiếp).
+            preexisting_target = self.pipeline_config['grasp'].get('target_instance_index')
+            if len(success_results) > 1 and preexisting_target is None:
+                chosen_idx = self._prompt_select_target_dialog(success_results)
+                if chosen_idx is not None:
+                    self.pipeline_config['grasp']['target_instance_index'] = chosen_idx
+                try:
+                    selected, select_logs = self._select_grasp_target(success_results)
+                finally:
+                    # Reset lại config sau khi dùng xong - mỗi lần chạy mới PHẢI
+                    # được chỉ định lại tường minh, tránh dùng nhầm target của
+                    # lần chạy trước cho layout instance mới.
+                    self.pipeline_config['grasp']['target_instance_index'] = preexisting_target
+            else:
+                selected, select_logs = self._select_grasp_target(success_results)
+            
+            for log_line in select_logs:
+                print(log_line)
+            
+            self.last_grasp_result = selected
+            selected_idx = selected['instance_index'] if selected is not None else None
+            
+            if selected is not None:
+                self.status_label.config(
+                    text=f"🟢 Grasp Pose OK! ({len(success_results)}/{len(all_results)} instance thành công, "
+                         f"target=instance {selected_idx + 1})",
+                    foreground='green'
+                )
+            else:
+                self.status_label.config(
+                    text=f"🟡 {len(success_results)}/{len(all_results)} instance thành công nhưng "
+                         f"CHƯA có target được chỉ định (xem cửa sổ kết quả)",
+                    foreground='orange'
+                )
+            
+            self.show_grasp_result_window(all_results, selected_instance_index=selected_idx)
+            self.save_grasp_result_json(all_results, selected_instance_index=selected_idx)
+            
+        except Exception as e:
+            print(f"❌ Lỗi run_hybrid_grasp_pipeline: {e}")
+            import traceback
+            traceback.print_exc()
+            self.status_label.config(text=f"🔴 Lỗi: {e}", foreground='red')
+        finally:
+            if was_previewing:
+                self._set_preview_active(True)
+
+    def show_grasp_result_window(self, all_results, selected_instance_index=None):
+        """Hiển thị bảng kết quả grasp pose (camera frame + robot base frame nếu có calib).
+        selected_instance_index: instance được CHỈ ĐỊNH RÕ làm target (qua config
+        target_instance_index, hoặc do chỉ có đúng 1 instance thành công) - KHÔNG
+        phải kết quả của một quy tắc tự động chọn theo mask_area. Có thể là None
+        nếu có nhiều instance hợp lệ nhưng chưa xác định target.
+        """
+        if self.grasp_result_window is None or not tk.Toplevel.winfo_exists(self.grasp_result_window):
+            self.grasp_result_window = tk.Toplevel(self.root)
+            self.grasp_result_window.title("🤖 Kết quả Grasp Pose (Hybrid 2D-3D)")
+            self.grasp_result_window.geometry("820x600")
+            self.grasp_result_window.configure(bg='#1e1e1e')
+            self.grasp_result_text = tk.Text(self.grasp_result_window, width=100, height=34,
+                                              bg='#1e1e1e', fg='#00ff88', font=('Consolas', 10))
+            self.grasp_result_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        
+        self.grasp_result_text.delete('1.0', tk.END)
+        
+        lines = []
+        lines.append("=" * 88)
+        lines.append("KẾT QUẢ HYBRID 2D-3D GRASP PIPELINE")
+        calib_txt = ('✅ ĐÃ LOAD (' + self.handeye_note + ')') if self.T_B_C is not None else '❌ CHƯA CÓ - chỉ hiển thị camera frame'
+        lines.append(f"Hand-eye calibration: {calib_txt}")
+        target_class_id = self.pipeline_config['grasp']['target_class_id']
+        lines.append(f"Target class_id: {target_class_id}  |  Chế độ chọn target: "
+                      f"{self.pipeline_config['grasp']['target_selection_rule']} "
+                      f"(KHÔNG tự chọn theo mask_area)")
+        lines.append("=" * 88 + "\n")
+        
+        for r in all_results:
+            idx = r['instance_index']
+            cls = r['class_id']
+            is_selected = (selected_instance_index is not None and idx == selected_instance_index)
+            marker = "  ⭐ [TARGET ĐƯỢC CHỈ ĐỊNH]" if is_selected else ""
+            lines.append(f"--- Instance {idx+1} (class={cls}){marker} ---")
+            if not r['success']:
+                lines.append(f"  ❌ THẤT BẠI: {r['reason']}\n")
+                continue
+            
+            pos_c = r['grasp_point_C'] * 1000.0
+            rotvec_c = self.hybrid_rotation_matrix_to_rotvec(r['R_C_G'])
+            
+            lines.append(f"  ✅ Số nhánh hợp lệ: {r['branch_count']}, độ dài dominant path: {r['dominant_branch_len_px']} px, "
+                          f"mask_area: {r['mask_area']} px")
+            if not is_selected:
+                lines.append(f"  ⚪ CANDIDATE POSE — KHÔNG GỬI ROBOT (chưa được chọn làm target)")
+            lines.append(f"  📷 CAMERA FRAME:")
+            lines.append(f"     X={pos_c[0]:8.2f}mm  Y={pos_c[1]:8.2f}mm  Z={pos_c[2]:8.2f}mm")
+            lines.append(f"     Rx={rotvec_c[0]:7.4f}  Ry={rotvec_c[1]:7.4f}  Rz={rotvec_c[2]:7.4f}  (rad, rotation vector)")
+            
+            if self.T_B_C is not None:
+                T_B_G = self.T_B_C @ r['T_C_G']
+                pos_b = T_B_G[:3, 3] * 1000.0
+                rotvec_b = self.hybrid_rotation_matrix_to_rotvec(T_B_G[:3, :3])
+                lines.append(f"  🤖 ROBOT BASE FRAME:")
+                lines.append(f"     X={pos_b[0]:8.2f}mm  Y={pos_b[1]:8.2f}mm  Z={pos_b[2]:8.2f}mm")
+                lines.append(f"     Rx={rotvec_b[0]:7.4f}  Ry={rotvec_b[1]:7.4f}  Rz={rotvec_b[2]:7.4f}  (rad, rotation vector)")
+                if is_selected:
+                    lines.append(f"     >>> LỆNH KẸP ROBOT: X={pos_b[0]:.2f} Y={pos_b[1]:.2f} Z={pos_b[2]:.2f} "
+                                  f"Rx={rotvec_b[0]:.4f} Ry={rotvec_b[1]:.4f} Rz={rotvec_b[2]:.4f}")
+                else:
+                    lines.append(f"     (CANDIDATE — KHÔNG gửi robot)")
+            lines.append("")
+        
+        if selected_instance_index is None and len([r for r in all_results if r['success']]) > 1:
+            lines.append("⚠️ Nhiều instance hợp lệ nhưng CHƯA có target được chỉ định rõ "
+                         "(pipeline_config['grasp']['target_instance_index']). Hệ thống KHÔNG tự "
+                         "chọn và KHÔNG gửi pose cho robot. Hãy chỉ định target_instance_index rõ ràng.")
+        
+        self.grasp_result_text.insert('1.0', '\n'.join(lines))
+
+    def save_grasp_result_json(self, all_results, selected_instance_index=None):
+        """Lưu log kết quả grasp pose ra Output_grasp/grasp_TIMESTAMP.json"""
+        try:
+            output_dir = "Output_grasp"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(output_dir, f"grasp_{ts}.json")
+            
+            data = {
+                'timestamp': ts, 'handeye_loaded': self.T_B_C is not None,
+                'target_class_id': self.pipeline_config['grasp']['target_class_id'],
+                'target_selection_rule': self.pipeline_config['grasp']['target_selection_rule'],
+                'selected_instance_index': selected_instance_index,
+                'instances': [],
+            }
+            
+            for r in all_results:
+                entry = {
+                    'instance_index': r['instance_index'], 'class_id': r['class_id'],
+                    'success': r['success'], 'reason': r['reason'],
+                    'is_target': (selected_instance_index is not None and r['instance_index'] == selected_instance_index),
+                }
+                if r['success']:
+                    pos_c = (r['grasp_point_C'] * 1000.0).tolist()
+                    rotvec_c = self.hybrid_rotation_matrix_to_rotvec(r['R_C_G']).tolist()
+                    entry['camera_frame'] = {'xyz_mm': pos_c, 'rotvec_rad': rotvec_c}
+                    entry['mask_area'] = r['mask_area']
+                    entry['branch_count'] = r['branch_count']
+                    entry['num_points_bud'] = r['num_points_bud']
+                    
+                    if self.T_B_C is not None:
+                        T_B_G = self.T_B_C @ r['T_C_G']
+                        pos_b = (T_B_G[:3, 3] * 1000.0).tolist()
+                        rotvec_b = self.hybrid_rotation_matrix_to_rotvec(T_B_G[:3, :3]).tolist()
+                        entry['robot_base_frame'] = {'xyz_mm': pos_b, 'rotvec_rad': rotvec_b}
+                data['instances'].append(entry)
+            
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Đã lưu kết quả grasp pose: {path}")
+        except Exception as e:
+            print(f"⚠️ Lỗi lưu grasp result JSON: {e}")
+
+    # ==========================================================================
+    # 🛠️ HAND-EYE CALIBRATION (Camera <-> Robot) bằng Checkerboard
+    # ==========================================================================
+    def load_handeye_calibration(self):
+        """Load handeye_calibration.json (nếu có) -> self.T_B_C (4x4) hoặc None."""
+        self.handeye_note = ''
+        path = os.path.join(os.path.dirname(__file__), 'handeye_calibration.json')
+        if not os.path.exists(path):
+            self.T_B_C = None
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            eye_config = data.get('eye_config', 'eye_to_hand')
+            if eye_config != 'eye_to_hand':
+                print("⚠️ File calibration ở chế độ eye_in_hand -> không tự động áp dụng làm T_B_C")
+                self.T_B_C = None
+                return
+            R = np.array(data['R'], dtype=np.float64)
+            t = np.array(data['t'], dtype=np.float64)
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = t
+            self.T_B_C = T
+            self.handeye_note = f"{eye_config}, {data.get('num_samples', '?')} mẫu, {data.get('timestamp', '?')}"
+            print(f"✅ Đã load hand-eye calibration: {path} ({self.handeye_note})")
+        except Exception as e:
+            print(f"⚠️ Lỗi load hand-eye calibration: {e}")
+            self.T_B_C = None
+
+    def euler_xyz_deg_to_matrix(self, rx_deg, ry_deg, rz_deg):
+        """
+        Chuyển góc Euler (độ, quy ước Rz*Ry*Rx - roll/pitch/yaw phổ biến) sang
+        ma trận xoay. ⚠️ Nếu robot dùng quy ước khác, cần điều chỉnh hàm này.
+        """
+        rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
+        Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+        Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+        Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+        return Rz @ Ry @ Rx
+
+    def open_handeye_calibration_window(self):
+        """Mở cửa sổ hiệu chỉnh Camera-Robot bằng checkerboard."""
+        if self.handeye_calib_window is not None and tk.Toplevel.winfo_exists(self.handeye_calib_window):
+            self.handeye_calib_window.lift()
+            return
+        
+        win = tk.Toplevel(self.root)
+        self.handeye_calib_window = win
+        win.title("🛠️ Hiệu chỉnh Camera-Robot (Hand-Eye Calibration)")
+        win.geometry("560x820")
+        win.configure(bg='#2d2d30')
+        
+        self.handeye_samples = []
+        
+        main = ttk.Frame(win, style='Dark.TFrame')
+        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        board_frame = ttk.LabelFrame(main, text="📐 Thông số bàn cờ Checkerboard", padding=10, style='Dark.TLabelframe')
+        board_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(board_frame, text="Số góc trong theo hàng:", style='Dark.TLabel').grid(row=0, column=0, sticky=tk.W, padx=5, pady=3)
+        self.he_rows_var = tk.IntVar(value=6)
+        ttk.Entry(board_frame, textvariable=self.he_rows_var, width=8).grid(row=0, column=1, padx=5, pady=3)
+        
+        ttk.Label(board_frame, text="Số góc trong theo cột:", style='Dark.TLabel').grid(row=0, column=2, sticky=tk.W, padx=5, pady=3)
+        self.he_cols_var = tk.IntVar(value=9)
+        ttk.Entry(board_frame, textvariable=self.he_cols_var, width=8).grid(row=0, column=3, padx=5, pady=3)
+        
+        ttk.Label(board_frame, text="Kích thước ô vuông (mm):", style='Dark.TLabel').grid(row=1, column=0, sticky=tk.W, padx=5, pady=3)
+        self.he_square_var = tk.DoubleVar(value=25.0)
+        ttk.Entry(board_frame, textvariable=self.he_square_var, width=8).grid(row=1, column=1, padx=5, pady=3)
+        
+        ttk.Label(board_frame, text="Cấu hình camera:", style='Dark.TLabel').grid(row=1, column=2, sticky=tk.W, padx=5, pady=3)
+        self.he_eye_config_var = tk.StringVar(value="eye_to_hand")
+        eye_combo = ttk.Combobox(board_frame, textvariable=self.he_eye_config_var, state='readonly', width=16,
+                                  values=["eye_to_hand", "eye_in_hand"])
+        eye_combo.grid(row=1, column=3, padx=5, pady=3)
+        
+        ttk.Label(board_frame,
+                  text="ℹ️ eye_to_hand: camera CỐ ĐỊNH, bàn cờ gắn trên gripper (khuyến nghị).\n"
+                       "   eye_in_hand: camera gắn trên gripper, bàn cờ cố định trong không gian.",
+                  style='Dark.TLabel', foreground='yellow', justify=tk.LEFT).grid(
+            row=2, column=0, columnspan=4, sticky=tk.W, padx=5, pady=5)
+        
+        pose_frame = ttk.LabelFrame(main, text="🤖 Pose Robot hiện tại (đọc từ Teach Pendant)", padding=10, style='Dark.TLabelframe')
+        pose_frame.pack(fill=tk.X, pady=5)
+        
+        self.he_pose_vars = {}
+        labels_units = [('X', 'mm'), ('Y', 'mm'), ('Z', 'mm'), ('Rx', 'deg'), ('Ry', 'deg'), ('Rz', 'deg')]
+        for i, (name, unit) in enumerate(labels_units):
+            ttk.Label(pose_frame, text=f"{name} ({unit}):", style='Dark.TLabel').grid(
+                row=i // 3, column=(i % 3) * 2, sticky=tk.W, padx=5, pady=3)
+            var = tk.DoubleVar(value=0.0)
+            ttk.Entry(pose_frame, textvariable=var, width=10).grid(row=i // 3, column=(i % 3) * 2 + 1, padx=5, pady=3)
+            self.he_pose_vars[name] = var
+        
+        ttk.Label(pose_frame, text="(Rx,Ry,Rz: góc Euler độ, quy ước R=Rz·Ry·Rx - điều chỉnh nếu robot khác quy ước)",
+                  style='Dark.TLabel', foreground='cyan').grid(row=2, column=0, columnspan=6, sticky=tk.W, padx=5, pady=3)
+        
+        self.he_canvas = tk.Canvas(main, width=480, height=360, bg='black', highlightthickness=0)
+        self.he_canvas.pack(pady=8)
+        
+        action_frame = ttk.Frame(main, style='Dark.TFrame')
+        action_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(action_frame, text="📸 Chụp mẫu hiệu chỉnh", command=self.capture_handeye_sample).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="🗑️ Xoá mẫu cuối", command=self.remove_last_handeye_sample).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="✅ Tính toán Calibration", command=self.compute_handeye_calibration).pack(side=tk.LEFT, padx=5)
+        
+        self.he_status_label = ttk.Label(main, text="Số mẫu đã chụp: 0", style='Dark.TLabel', foreground='cyan')
+        self.he_status_label.pack(anchor=tk.W, pady=5)
+
+    def capture_handeye_sample(self):
+        """Chụp 1 mẫu hiệu chỉnh: phát hiện checkerboard + đọc pose robot user nhập."""
+        try:
+            rows = int(self.he_rows_var.get())
+            cols = int(self.he_cols_var.get())
+            square_mm = float(self.he_square_var.get())
+            
+            intr = self.hybrid_get_intrinsics()
+            if intr is None:
+                messagebox.showerror("Lỗi", "Không lấy được camera intrinsics!")
+                return
+            
+            was_previewing = self.is_preview
+            self._set_preview_active(False)
+            try:
+                with self.camera_lock:
+                    frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+                    aligned_frames = self.align.process(frames)
+                color_frame = aligned_frames.get_color_frame()
+            finally:
+                if was_previewing:
+                    self._set_preview_active(True)
+            
+            if not color_frame:
+                messagebox.showerror("Lỗi", "Không lấy được ảnh màu!")
+                return
+            
+            color_image = np.asanyarray(color_frame.get_data())
+            gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            
+            pattern_size = (cols, rows)
+            found, corners = cv2.findChessboardCorners(
+                gray, pattern_size,
+                flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+            )
+            
+            if not found:
+                messagebox.showwarning(
+                    "Không tìm thấy bàn cờ",
+                    "Không phát hiện được checkerboard trong ảnh. Hãy đảm bảo bàn cờ nằm trọn trong khung hình.")
+                return
+            
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            corners_refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            
+            objp = np.zeros((rows * cols, 3), dtype=np.float64)
+            objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * (square_mm / 1000.0)
+            
+            camera_matrix = np.array([
+                [intr['fx'], 0, intr['cx']],
+                [0, intr['fy'], intr['cy']],
+                [0, 0, 1]
+            ], dtype=np.float64)
+            dist_coeffs = np.array(intr['coeffs'], dtype=np.float64).reshape(-1, 1)
+            
+            ok, rvec, tvec = cv2.solvePnP(objp, corners_refined, camera_matrix, dist_coeffs,
+                                           flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                messagebox.showerror("Lỗi", "solvePnP thất bại!")
+                return
+            
+            R_target2cam, _ = cv2.Rodrigues(rvec)
+            t_target2cam = tvec.flatten()
+            
+            x_mm = self.he_pose_vars['X'].get()
+            y_mm = self.he_pose_vars['Y'].get()
+            z_mm = self.he_pose_vars['Z'].get()
+            rx_deg = self.he_pose_vars['Rx'].get()
+            ry_deg = self.he_pose_vars['Ry'].get()
+            rz_deg = self.he_pose_vars['Rz'].get()
+            
+            R_gripper2base = self.euler_xyz_deg_to_matrix(rx_deg, ry_deg, rz_deg)
+            t_gripper2base = np.array([x_mm, y_mm, z_mm], dtype=np.float64) / 1000.0
+            
+            self.handeye_samples.append({
+                'R_target2cam': R_target2cam, 't_target2cam': t_target2cam,
+                'R_gripper2base': R_gripper2base, 't_gripper2base': t_gripper2base,
+            })
+            
+            preview = color_image.copy()
+            cv2.drawChessboardCorners(preview, pattern_size, corners_refined, found)
+            preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+            preview_resized = cv2.resize(preview_rgb, (480, 360))
+            img_pil = Image.fromarray(preview_resized)
+            img_tk = ImageTk.PhotoImage(image=img_pil)
+            self.he_canvas.create_image(240, 180, image=img_tk)
+            self.he_canvas.image = img_tk
+            
+            self.he_status_label.config(text=f"Số mẫu đã chụp: {len(self.handeye_samples)}", foreground='lime')
+        
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Lỗi chụp mẫu hiệu chỉnh: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def remove_last_handeye_sample(self):
+        if self.handeye_samples:
+            self.handeye_samples.pop()
+            self.he_status_label.config(text=f"Số mẫu đã chụp: {len(self.handeye_samples)}", foreground='cyan')
+
+    def compute_handeye_calibration(self):
+        """Tính toán hand-eye calibration (cv2.calibrateHandEye) từ các mẫu đã chụp."""
+        n = len(self.handeye_samples)
+        if n < 3:
+            messagebox.showwarning("Chưa đủ mẫu", f"Cần ít nhất 3 mẫu (khuyến nghị >=10). Hiện có {n} mẫu.")
+            return
+        
+        try:
+            eye_config = self.he_eye_config_var.get()
+            
+            R_gripper2base_list = [s['R_gripper2base'] for s in self.handeye_samples]
+            t_gripper2base_list = [s['t_gripper2base'] for s in self.handeye_samples]
+            R_target2cam_list = [s['R_target2cam'] for s in self.handeye_samples]
+            t_target2cam_list = [s['t_target2cam'].reshape(3, 1) for s in self.handeye_samples]
+            
+            if eye_config == 'eye_to_hand':
+                # Camera cố định, bàn cờ gắn trên gripper: dùng nghịch đảo
+                # (base2gripper) thay cho gripper2base -> kết quả trả về sẽ là
+                # (R_cam2base, t_cam2base) = T_B_C trực tiếp.
+                R_in, t_in = [], []
+                for R_g2b, t_g2b in zip(R_gripper2base_list, t_gripper2base_list):
+                    R_b2g = R_g2b.T
+                    t_b2g = -R_b2g @ t_g2b
+                    R_in.append(R_b2g)
+                    t_in.append(t_b2g.reshape(3, 1))
+            else:
+                R_in = R_gripper2base_list
+                t_in = [t.reshape(3, 1) for t in t_gripper2base_list]
+            
+            R_cam2x, t_cam2x = cv2.calibrateHandEye(
+                R_in, t_in, R_target2cam_list, t_target2cam_list,
+                method=cv2.CALIB_HAND_EYE_TSAI
+            )
+            
+            T_B_C = np.eye(4)
+            T_B_C[:3, :3] = R_cam2x
+            T_B_C[:3, 3] = t_cam2x.flatten()
+            
+            if eye_config == 'eye_in_hand':
+                messagebox.showwarning(
+                    "Eye-in-hand",
+                    "Chế độ eye_in_hand cần pose robot LIVE tại thời điểm chạy để quy đổi "
+                    "sang robot base frame. Ứng dụng chưa có kết nối robot trực tiếp nên sẽ "
+                    "lưu T_cam2gripper nhưng KHÔNG dùng làm T_B_C mặc định."
+                )
+                self.T_B_C = None
+            else:
+                self.T_B_C = T_B_C
+            
+            data = {
+                'eye_config': eye_config,
+                'R': R_cam2x.tolist(),
+                't': t_cam2x.flatten().tolist(),
+                'num_samples': n,
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'square_size_mm': float(self.he_square_var.get()),
+                'board_rows': int(self.he_rows_var.get()),
+                'board_cols': int(self.he_cols_var.get()),
+            }
+            
+            path = os.path.join(os.path.dirname(__file__), 'handeye_calibration.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            
+            self.handeye_note = f"{eye_config}, {n} mẫu, {data['timestamp']}"
+            if hasattr(self, 'handeye_status_label'):
+                self.handeye_status_label.config(
+                    text="🛠️ Hand-eye: " + (self.handeye_note if self.T_B_C is not None else "eye_in_hand (chưa áp dụng)"),
+                    foreground='lime' if self.T_B_C is not None else 'orange')
+            
+            messagebox.showinfo("Thành công",
+                                 f"Đã tính toán và lưu hand-eye calibration ({eye_config}, {n} mẫu)\nFile: {path}")
+            self.he_status_label.config(text=f"✅ Đã tính xong calibration ({n} mẫu)", foreground='lime')
+        
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Lỗi tính toán calibration: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ==================== END HYBRID 2D-3D GRASP PIPELINE ====================
 
 if __name__ == "__main__":
     root = tk.Tk()
