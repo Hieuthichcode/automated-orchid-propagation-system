@@ -36,7 +36,7 @@ This project combines a custom-built **6-DOF serial robot arm** with an **Intel 
 RGB-D acquisition (RealSense D435i)
         │
         ▼
-Instance segmentation (YOLOv8, best.pt)
+Instance segmentation (YOLOv8, v8_seg_1024.pt)
         │  detect & segment each orchid bud
         ▼
 2D skeleton extraction
@@ -88,7 +88,8 @@ three subsets.
 The instance-segmentation model was trained for 380 epochs using AdamW with a
 learning rate of 0.001 and an input size of 1024 × 1024 pixels. The selected
 model achieved a mask mAP@0.5 of 0.970 on the validation set. The recommended
-inference weight is `best.pt` in the shared Google Drive folder.
+inference weight is `best.pt` in the shared Google Drive folder — rename it to
+`v8_seg_1024.pt` after downloading (this is the filename the code expects).
 
 ---
 
@@ -201,7 +202,8 @@ STATUS                                    # Print current joint angles
 
 **Requirements:** Python 3.11, see [Dependencies](#dependencies)
 
-1. Download `best.pt` from the [Google Drive folder](https://drive.google.com/drive/folders/1FqTuIMWtxHYL037exPB-O3m-0CBoGs5N?usp=drive_link) (`Model_train/weights/best.pt`) and place it in the `Vision2D-3D/` directory.
+1. Download `best.pt` from the [Google Drive folder](https://drive.google.com/drive/folders/1FqTuIMWtxHYL037exPB-O3m-0CBoGs5N?usp=drive_link) (`Model_train/weights/best.pt`), rename it to **`v8_seg_1024.pt`**, and place it in the `Vision2D-3D/` directory.
+   > `v8_seg_1024.pt` is `best.pt` from the Drive folder renamed for local use — the code loads this filename by default.
 
 ```bash
 cd Vision2D-3D
