@@ -87,9 +87,11 @@ three subsets.
 
 The instance-segmentation model was trained for 380 epochs using AdamW with a
 learning rate of 0.001 and an input size of 1024 × 1024 pixels. The selected
-model achieved a mask mAP@0.5 of 0.970 on the validation set. The recommended
-inference weight is `best.pt` in the shared Google Drive folder — rename it to
-`v8_seg_1024.pt` after downloading (this is the filename the code expects).
+model achieved a mask mAP@0.5 of 0.970 on the validation set.
+The repository includes `Vision2D-3D/v8_seg_1024.pt`, which is the
+`best.pt` checkpoint from the shared Google Drive folder renamed to match
+the filename used by the application. The same checkpoint is also available
+as `Model_train/weights/best.pt` in the shared Google Drive folder.
 
 ---
 
@@ -128,7 +130,7 @@ Results correspond to 520 RGB-D samples from 250 specimens.
     ├── view_pointcloud.py        # Point cloud viewer utility
     ├── ply_editor.py             # PLY file editor
     ├── draw.py                   # Evaluation plots (speed vs. accuracy)
-    ├── v8m-seg-832.pt            # Trained YOLOv8m segmentation model
+    ├── v8_seg_1024.pt            # Segmentation model used by the application
     ├── roi_config.txt            # Saved ROI configuration
     ├── Output_image/             # Exported result images
     └── Output_pointcloud/        # Exported .pcd/.ply + JSON tip data
@@ -202,8 +204,9 @@ STATUS                                    # Print current joint angles
 
 **Requirements:** Python 3.11, see [Dependencies](#dependencies)
 
-1. Download `best.pt` from the [Google Drive folder](https://drive.google.com/drive/folders/1FqTuIMWtxHYL037exPB-O3m-0CBoGs5N?usp=drive_link) (`Model_train/weights/best.pt`), rename it to **`v8_seg_1024.pt`**, and place it in the `Vision2D-3D/` directory.
-   > `v8_seg_1024.pt` is `best.pt` from the Drive folder renamed for local use — the code loads this filename by default.
+The application uses the bundled `Vision2D-3D/v8_seg_1024.pt` checkpoint.
+The same checkpoint is also available as `Model_train/weights/best.pt` in the
+[shared Google Drive folder](https://drive.google.com/drive/folders/1FqTuIMWtxHYL037exPB-O3m-0CBoGs5N?usp=drive_link).
 
 ```bash
 cd Vision2D-3D

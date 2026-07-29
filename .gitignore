@@ -6,6 +6,7 @@ venv/
 
 # Model weights and training outputs
 *.pt
+!Vision2D-3D/v8_seg_1024.pt
 runs/
 weights/
 
