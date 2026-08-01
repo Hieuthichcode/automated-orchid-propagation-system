@@ -76,6 +76,10 @@ The shared folder contains:
 - `Data_test/angularError_data.xlsx`: angular-error evaluation data;
 - `Data_test/Time_data.xlsx`: processing-time evaluation data.
 
+The dataset consists of Phalaenopsis orchid bud images captured under laboratory
+conditions using the Intel RealSense D435i camera, covering diverse lighting,
+angles, and growth stages.
+
 ---
 
 ## Segmentation model
