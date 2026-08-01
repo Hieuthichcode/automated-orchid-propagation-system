@@ -78,8 +78,8 @@ The shared folder contains:
 
 The segmentation dataset contained 3,104 original RGB images. The
 train/validation/test split (75%/15%/10%) was applied before augmentation, and
-only the training subset was augmented, resulting in 11,876 images across the
-three subsets.
+only the training subset was augmented (resulting in 11,640 training images),
+giving a total of 12,416 images across the three subsets.
 
 ---
 
