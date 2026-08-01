@@ -1,6 +1,6 @@
 # Automated Orchid Propagation System
 
-> **Graduation Thesis (DATN)** — A hybrid 2D–3D RGB-D method for estimating the
+> A hybrid 2D–3D RGB-D method for estimating the
 > growth axis of Phalaenopsis orchid buds and converting the estimated axis into
 > a robot-referenced 6-DOF grasp pose, integrated with a custom 6-DOF robot arm.
 
