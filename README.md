@@ -76,10 +76,9 @@ The shared folder contains:
 - `Data_test/angularError_data.xlsx`: angular-error evaluation data;
 - `Data_test/Time_data.xlsx`: processing-time evaluation data.
 
-The segmentation dataset contained 3,104 original RGB images. The
-train/validation/test split (75%/15%/10%) was applied before augmentation, and
-only the training subset was augmented (resulting in 11,640 training images),
-giving a total of 12,416 images across the three subsets.
+The dataset consists of Phalaenopsis orchid bud images captured under laboratory
+conditions using the Intel RealSense D435i camera, covering diverse lighting,
+angles, and growth stages.
 
 ---
 
