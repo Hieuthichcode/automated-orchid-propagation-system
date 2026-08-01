@@ -142,7 +142,7 @@ Results correspond to 520 RGB-D samples from 250 specimens.
 | Robot controller | Arduino Mega 2560 |
 | Joints | 6× stepper motors (5× TB6600 and 1× TMC2208 drivers) |
 | Depth camera | Intel RealSense D435i |
-| End-effector | Pneumatic gripper (SMC MHZ2-16D) |
+| End-effector | Gripper fabricated from PETG by three-dimensional printing |
 | Gripper control | Digital pin D3 (HIGH = close) |
 | Task triggers | Digital pins D2, D14, D15 |
 
@@ -297,8 +297,7 @@ Third-party component models included:
 - `stepper 24BYJ-48` — Seeed Studio
 - `28BYJ-48` stepper + ULN2003 driver board
 - `NEMA17 42-40` stepper
-- `Servo SG90`
-- `SMC MHZ2-16D` pneumatic gripper
+- `Servo SG90` gripper 
 - `TB6600` stepper driver
 - V-slot rail wheel (625-2Z bearing)
 
