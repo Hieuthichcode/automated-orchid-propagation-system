@@ -78,7 +78,9 @@ The shared folder contains:
 
 The dataset consists of Phalaenopsis orchid bud images captured under laboratory
 conditions using the Intel RealSense D435i camera, covering diverse lighting,
-angles, and growth stages.
+angles, and growth stages. It contains 3,104 original RGB images split
+75%/15%/10% (train/val/test); only the training subset was augmented, resulting
+in 11,640 training images and 12,416 images in total across all three subsets.
 
 ---
 
