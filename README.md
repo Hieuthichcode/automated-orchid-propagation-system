@@ -28,12 +28,12 @@ a robot-referenced 6-DOF grasp pose. The pipeline combines instance
 segmentation, 2D skeleton guidance, depth-based point-cloud processing, and PCA
 axis estimation.
 
-This project combines a custom-built **6-DOF serial robot arm** with an **Intel RealSense D435i depth camera** and a **YOLOv8 instance segmentation model** to autonomously detect, locate, and manipulate orchid shoots (*mầm lan*) — replacing manual labor in orchid propagation.
+This project combines a custom-built **6-DOF serial robot arm** with an **Intel RealSense D435 depth camera** and a **YOLOv8 instance segmentation model** to autonomously detect, locate, and manipulate orchid shoots (*mầm lan*) — replacing manual labor in orchid propagation.
 
 ### System Pipeline
 
 ```
-RGB-D acquisition (RealSense D435i)
+RGB-D acquisition (RealSense D435)
         │
         ▼
 Instance segmentation (YOLOv8, v8_seg_1024.pt)
@@ -77,7 +77,7 @@ The shared folder contains:
 - `Data_test/Time_data.xlsx`: processing-time evaluation data.
 
 The dataset consists of Phalaenopsis orchid bud images captured under laboratory
-conditions using the Intel RealSense D435i camera, covering diverse lighting,
+conditions using the Intel RealSense D435 camera, covering diverse lighting,
 angles, and growth stages. It contains 3,104 original RGB images split
 75%/15%/10% (train/val/test). Following augmentation applied exclusively to the training subset, the complete dataset contained 12,416 images: 11,640 images in the training set, 466 images in the validation set, and 310 images in the test set.
 
@@ -141,7 +141,7 @@ Results correspond to 520 RGB-D samples from 250 specimens.
 |---|---|
 | Robot controller | Arduino Mega 2560 |
 | Joints | 6× stepper motors (5× TB6600 and 1× TMC2208 drivers) |
-| Depth camera | Intel RealSense D435i |
+| Depth camera | Intel RealSense D435 |
 | End-effector | Gripper fabricated from PETG by three-dimensional printing |
 | Gripper control | Digital pin D3 (HIGH = close) |
 | Task triggers | Digital pins D2, D14, D15 |
